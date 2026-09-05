@@ -1,0 +1,8 @@
+.env
+*.out
+*.log
+/bin/api
+*.webp
+*.jpg
+cors.json
+*.html
