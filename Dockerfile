@@ -19,6 +19,6 @@ WORKDIR /
 COPY --from=bin-stage /bin/api /bin/api
 VOLUME /var/log
 
-EXPOSE 3000
+EXPOSE 3001
 
 CMD ["/bin/api"]
