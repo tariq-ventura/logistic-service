@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	assignmets_db "github.com/tariq-ventura/logistic-service/internal/assigments/db"
 	database_postgres "github.com/tariq-ventura/logistic-service/internal/database/postgres"
 	"github.com/tariq-ventura/logistic-service/internal/interfaces"
 	"github.com/tariq-ventura/logistic-service/internal/logging"
@@ -12,7 +13,8 @@ import (
 )
 
 type Database struct {
-	Requests requets_db.IRequestsDB
+	Requests    requets_db.IRequestsDB
+	Assignments assignmets_db.IAssignmentsDB
 }
 
 type IDatabase interface {
@@ -40,8 +42,15 @@ var SetupDatabase = func(ctx context.Context, l logging.ILogging, t interfaces.I
 			return nil, nil, err
 		}
 
+		assigment, err := assignmets_db.NewDatabase(ctx, l, t, db.Client)
+
+		if err != nil {
+			return nil, nil, err
+		}
+
 		return &Database{
-			Requests: request,
+			Requests:    request,
+			Assignments: assigment,
 		}, db, err
 	default:
 		return nil, nil, errors.New("unsupported database backend")

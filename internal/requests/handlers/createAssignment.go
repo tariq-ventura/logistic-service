@@ -1,4 +1,4 @@
-package assignments_handlers
+package requests_handlers
 
 import (
 	"net/http"
@@ -13,7 +13,7 @@ import (
 	"github.com/tariq-ventura/logistic-service/internal/validations"
 )
 
-func (ah *AssignmentHandler) CreateAssignment(c *gin.Context) {
+func (ah *RequestHandler) CreateAssignment(c *gin.Context) {
 	ctx := c.Request.Context()
 	now := time.Now().UTC()
 	requestID, ok := validations.ParseUUIDParameter(c, "requestID")
@@ -69,7 +69,7 @@ func (ah *AssignmentHandler) CreateAssignment(c *gin.Context) {
 	dbSpan, dbCtx := ah.trace.StartSpan(ctx, "assignments.database.connection", map[string]any{
 		"db.name": "assignments",
 	})
-	database := ah.db
+	database := ah.assignments
 	dbSpan.End()
 
 	operationSpan, _ := ah.trace.StartSpan(dbCtx, "assignments.database.operations", map[string]any{
@@ -78,7 +78,7 @@ func (ah *AssignmentHandler) CreateAssignment(c *gin.Context) {
 	})
 	defer operationSpan.End()
 
-	request, databaseError := ah.requestsDB.ListRequestById(requestID)
+	request, databaseError := ah.db.ListRequestById(requestID)
 	if databaseError != nil {
 		c.JSON(databaseError.StatusCode, gin.H{
 			"error":   databaseError.Error,
@@ -177,7 +177,7 @@ func (ah *AssignmentHandler) CreateAssignment(c *gin.Context) {
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Maquinaria asignada correctamente",
-		"data":    assignment,
+		"data":    data,
 	})
 
 }

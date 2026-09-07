@@ -41,6 +41,7 @@ func runApp(ctx context.Context, l logging.ILogging, t interfaces.ITrace) error 
 	}
 
 	r.RequestsDB = database.Requests
+	r.AssignmentsDB = database.Assignments
 
 	fleetServiceURL, err := validations.RequiredEnv("FLEET_SERVICE_URL")
 	if err != nil {

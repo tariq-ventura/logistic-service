@@ -120,11 +120,7 @@ func (pc *PostgresClient) CreateAssignment(assignment assignments_domain.Assignm
 				map[string]any{"error": transactionError.Error()},
 			)
 
-			return &interfaces.Error{
-				Error:      "database_error",
-				Message:    "No se pudo crear la asignación",
-				StatusCode: http.StatusInternalServerError,
-			}
+			return validations.AssignmentDatabaseError()
 		}
 	}
 
