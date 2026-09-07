@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	clients_fleet "github.com/tariq-ventura/logistic-service/internal/clients/fleet"
+	"github.com/tariq-ventura/logistic-service/internal/interfaces"
 )
 
 var (
@@ -57,4 +58,20 @@ func WriteFleetError(c *gin.Context, err error) {
 		"error":   "fleet_service_unavailable",
 		"message": "No se pudo establecer comunicación con Fleet",
 	})
+}
+
+func AssignmentNotFound() *interfaces.Error {
+	return &interfaces.Error{
+		Error:      "assignment_not_found",
+		Message:    "La asignación no existe",
+		StatusCode: http.StatusNotFound,
+	}
+}
+
+func AssignmentDatabaseError() *interfaces.Error {
+	return &interfaces.Error{
+		Error:      "database_error",
+		Message:    "No se pudo consultar la asignación",
+		StatusCode: http.StatusInternalServerError,
+	}
 }

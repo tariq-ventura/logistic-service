@@ -1,8 +1,9 @@
 package assignments_domain
 
+import "github.com/gin-gonic/gin"
+
 type IAssignments interface {
-	// CreateAssignment(c *gin.Context)
-	// ListAssignments(c *gin.Context)
-	// ListAssignmentByRequestID(c *gin.Context)
-	// UpdateAssignmentStatus(c *gin.Context)
+	ListAssginments(c *gin.Context)
+	ListAssginmentById(c *gin.Context)
+	UpdateAssignmentStatus(c *gin.Context)
 }

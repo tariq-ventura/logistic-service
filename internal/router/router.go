@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	assignmets_db "github.com/tariq-ventura/logistic-service/internal/assigments/db"
 	clients_fleet "github.com/tariq-ventura/logistic-service/internal/clients/fleet"
 	"github.com/tariq-ventura/logistic-service/internal/interfaces"
 	"github.com/tariq-ventura/logistic-service/internal/logging"
@@ -12,12 +13,13 @@ import (
 )
 
 type Routes struct {
-	Routes      *gin.Engine
-	Context     *gin.Context
-	FleetClient *clients_fleet.Client
-	Logging     logging.ILogging
-	Trace       interfaces.ITrace
-	RequestsDB  requets_db.IRequestsDB
+	Routes        *gin.Engine
+	Context       *gin.Context
+	FleetClient   *clients_fleet.Client
+	Logging       logging.ILogging
+	Trace         interfaces.ITrace
+	RequestsDB    requets_db.IRequestsDB
+	AssignmentsDB assignmets_db.IAssignmentsDB
 }
 
 func (r *Routes) SetupRouter() *gin.Engine {
@@ -27,6 +29,7 @@ func (r *Routes) SetupRouter() *gin.Engine {
 
 	r.HealthCheckRoutes()
 	r.RequestsRoutes(r.Routes)
+	r.AssignmentsRoutes(r.Routes)
 	return r.Routes
 }
 
