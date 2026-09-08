@@ -14,6 +14,9 @@ type CreateRequest struct {
 
 	Location LocationRequest `json:"location" binding:"required"`
 
+	Description  string `json:"description" binding:"max=2000"`
+	Requirements string `json:"requirements" binding:"max=2000"`
+
 	StartDate time.Time `json:"startDate" binding:"required"`
 	EndDate   time.Time `json:"endDate" binding:"required"`
 }

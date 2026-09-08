@@ -19,7 +19,15 @@ type IRequestsDB interface {
 	ListRequests(page, pageSize int) ([]requests_domain.Request, *interfaces.Error, int64)
 	ListRequestById(id uuid.UUID) (*requests_domain.Request, *interfaces.Error)
 	ListRequestStatusHistory(id uuid.UUID) ([]requests_domain.RequestStatusHistory, *interfaces.Error)
-	SearchRequests(input requests_dto.SearchRequestsRequest) ([]requests_dto.SearchRequestResult, int64, *interfaces.Error)
+	SearchRequests(ctx context.Context, input requests_dto.SearchRequestsRequest) ([]requests_dto.SearchRequestResult, *interfaces.Error, int64)
+	SaveRequestEmbedding(
+		ctx context.Context,
+		requestID uuid.UUID,
+		provider string,
+		model string,
+		content string,
+		embedding []float32,
+	) *interfaces.Error
 	UpdateRequest(id uuid.UUID, updates map[string]any) (*requests_domain.Request, *interfaces.Error)
 	UpdateRequestStatus(requestID uuid.UUID, newStatus requests_domain.RequestStatus, reason string) (*requests_domain.Request, *requests_domain.RequestStatusHistory, *interfaces.Error)
 }

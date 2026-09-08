@@ -1,12 +1,15 @@
 package requests_db_postgres
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
+	"github.com/pgvector/pgvector-go"
 	"github.com/tariq-ventura/logistic-service/internal/interfaces"
-	requests_domain "github.com/tariq-ventura/logistic-service/internal/requests/domain"
 	requests_dto "github.com/tariq-ventura/logistic-service/internal/requests/dto"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const requestDistanceSQL = `
@@ -15,175 +18,227 @@ const requestDistanceSQL = `
 			1,
 			GREATEST(
 				-1,
-				COS(RADIANS(?)) *
-				COS(RADIANS(latitude)) *
-				COS(RADIANS(longitude) - RADIANS(?)) +
-				SIN(RADIANS(?)) *
-				SIN(RADIANS(latitude))
+				COS(RADIANS(?))
+				* COS(RADIANS(lr.latitude))
+				* COS(RADIANS(lr.longitude) - RADIANS(?))
+				+ SIN(RADIANS(?))
+				* SIN(RADIANS(lr.latitude))
 			)
 		)
 	)
 `
 
-func (pc *PostgresClient) SearchRequests(input requests_dto.SearchRequestsRequest) ([]requests_dto.SearchRequestResult, int64, *interfaces.Error) {
-	operationSpan, spanCtx := pc.trace.StartSpan(
-		pc.ctx,
-		"requests.database.postgres.search",
-		map[string]any{
-			"db.name":          "requests",
-			"db.operation":     "search",
-			"db.type":          "postgresql",
-			"request.query":    input.Query,
-			"request.page":     input.Page,
-			"request.pageSize": input.PageSize,
-		},
-	)
-	defer operationSpan.End()
+func (pc *PostgresClient) SearchRequests(ctx context.Context, input requests_dto.SearchRequestsRequest) ([]requests_dto.SearchRequestResult, *interfaces.Error, int64) {
+	if input.Page <= 0 {
+		input.Page = 1
+	}
+
+	if input.PageSize <= 0 {
+		input.PageSize = 20
+	}
+
+	if input.PageSize > 100 {
+		input.PageSize = 100
+	}
 
 	query := pc.client.
-		WithContext(spanCtx).
-		Model(&requests_domain.Request{})
+		WithContext(ctx).
+		Table("logistics_requests AS lr").
+		Joins(`
+			LEFT JOIN logistics_request_embeddings AS lre
+				ON lre.request_id = lr.id
+		`)
 
-	searchText := strings.TrimSpace(input.Query)
+	if value := strings.TrimSpace(input.Query); value != "" {
+		pattern := "%" + value + "%"
 
-	if searchText != "" {
-		searchPattern := "%" + searchText + "%"
-
-		query = query.Where(
-			`(
-				project_name ILIKE ?
-				OR location_name ILIKE ?
-				OR equipment_type ILIKE ?
-			)`,
-			searchPattern,
-			searchPattern,
-			searchPattern,
+		query = query.Where(`
+			lr.project_name ILIKE ?
+			OR lr.location_name ILIKE ?
+			OR lr.equipment_type ILIKE ?
+			OR lr.description ILIKE ?
+			OR lr.requirements ILIKE ?
+		`,
+			pattern,
+			pattern,
+			pattern,
+			pattern,
+			pattern,
 		)
 	}
 
-	statuses := make([]string, 0, len(input.Statuses))
+	if len(input.Statuses) > 0 {
+		query = query.Where(
+			"lr.status IN ?",
+			input.Statuses,
+		)
+	}
 
-	for _, status := range input.Statuses {
-		normalizedStatus := strings.ToUpper(strings.TrimSpace(status))
+	if value := strings.TrimSpace(input.EquipmentType); value != "" {
+		query = query.Where(
+			"lr.equipment_type = ?",
+			value,
+		)
+	}
 
-		if normalizedStatus != "" {
-			statuses = append(statuses, normalizedStatus)
+	var vector pgvector.Vector
+	hasSemanticQuery := len(input.QueryEmbedding) > 0
+
+	if hasSemanticQuery {
+		vector = pgvector.NewVector(input.QueryEmbedding)
+
+		query = query.Where(
+			"lre.embedding IS NOT NULL",
+		)
+
+		if input.MinSemanticScore != nil {
+			query = query.Where(
+				"(1 - (lre.embedding <=> ?)) >= ?",
+				vector,
+				*input.MinSemanticScore,
+			)
 		}
 	}
 
-	if len(statuses) > 0 {
-		query = query.Where("status IN ?", statuses)
-	}
+	hasLocation := input.Near != nil
 
-	equipmentType := strings.ToUpper(
-		strings.TrimSpace(input.EquipmentType),
-	)
+	if hasLocation {
+		radiusKM := input.Near.RadiusKM
+		if radiusKM <= 0 {
+			radiusKM = 50
+		}
 
-	if equipmentType != "" {
-		query = query.Where(
-			"equipment_type = ?",
-			equipmentType,
-		)
-	}
-
-	if input.Near != nil {
 		query = query.Where(
 			requestDistanceSQL+" <= ?",
 			input.Near.Latitude,
 			input.Near.Longitude,
 			input.Near.Latitude,
-			input.Near.RadiusKM,
+			radiusKM,
 		)
 	}
 
 	var total int64
 
-	if err := query.Count(&total).Error; err != nil {
+	countQuery := query.Session(&gorm.Session{})
+
+	if err := countQuery.
+		Distinct("lr.id").
+		Count(&total).
+		Error; err != nil {
 		pc.logging.LogError(
 			"requests_search_count_error",
-			map[string]any{
-				"error": err.Error(),
-			},
+			map[string]any{"error": err.Error()},
 		)
 
-		return nil, 0, &interfaces.Error{
+		return nil, &interfaces.Error{
 			Error:      "database_error",
 			Message:    "No se pudieron contar las solicitudes",
 			StatusCode: http.StatusInternalServerError,
-		}
+		}, 0
 	}
 
-	results := make(
-		[]requests_dto.SearchRequestResult,
-		0,
-	)
+	selectParts := []string{
+		"lr.id",
+		"lr.equipment_type",
+		"lr.project_name",
+		"lr.location_name",
+		"lr.latitude",
+		"lr.longitude",
+		"lr.description",
+		"lr.requirements",
+		"lr.start_date",
+		"lr.end_date",
+		"lr.status",
+		"lr.created_at",
+		"lr.updated_at",
+	}
 
-	selectFields := `
-	id,
-	equipment_type,
-	project_name,
-	location_name,
-	latitude,
-	longitude,
-	start_date,
-	end_date,
-	status,
-	created_at,
-	updated_at,
-	NULL::double precision AS distance_km
-`
+	selectArguments := make([]any, 0)
 
-	if input.Near != nil {
-		selectFields = `
-		id,
-		equipment_type,
-		project_name,
-		location_name,
-		latitude,
-		longitude,
-		start_date,
-		end_date,
-		status,
-		created_at,
-		updated_at,
-	` + requestDistanceSQL + ` AS distance_km`
+	if hasSemanticQuery {
+		selectParts = append(
+			selectParts,
+			"GREATEST(0, 1 - (lre.embedding <=> ?)) AS semantic_score",
+		)
 
-		query = query.Select(
-			selectFields,
+		selectArguments = append(
+			selectArguments,
+			vector,
+		)
+	} else {
+		selectParts = append(
+			selectParts,
+			"NULL::double precision AS semantic_score",
+		)
+	}
+
+	if hasLocation {
+		selectParts = append(
+			selectParts,
+			requestDistanceSQL+" AS distance_km",
+		)
+
+		selectArguments = append(
+			selectArguments,
 			input.Near.Latitude,
 			input.Near.Longitude,
 			input.Near.Latitude,
 		)
-
-		query = query.Order(
-			"distance_km ASC, created_at DESC",
-		)
 	} else {
-		query = query.
-			Select(selectFields).
-			Order("created_at DESC")
+		selectParts = append(
+			selectParts,
+			"NULL::double precision AS distance_km",
+		)
 	}
+
+	rowsQuery := query.Select(
+		strings.Join(selectParts, ",\n"),
+		selectArguments...,
+	)
+
+	if hasSemanticQuery {
+		rowsQuery = rowsQuery.Clauses(
+			clause.OrderBy{
+				Expression: clause.Expr{
+					SQL:                "lre.embedding <=> ?",
+					Vars:               []any{vector},
+					WithoutParentheses: true,
+				},
+			},
+		)
+	}
+
+	if hasLocation {
+		rowsQuery = rowsQuery.Order(
+			"distance_km ASC",
+		)
+	}
+
+	rowsQuery = rowsQuery.Order(
+		"lr.created_at DESC",
+	)
+
+	var requests []requests_dto.SearchRequestResult
 
 	offset := (input.Page - 1) * input.PageSize
 
-	if err := query.
+	result := rowsQuery.
 		Limit(input.PageSize).
 		Offset(offset).
-		Scan(&results).
-		Error; err != nil {
+		Scan(&requests)
+
+	if result.Error != nil {
 		pc.logging.LogError(
 			"requests_search_error",
-			map[string]any{
-				"error": err.Error(),
-			},
+			map[string]any{"error": result.Error.Error()},
 		)
 
-		return nil, 0, &interfaces.Error{
+		return nil, &interfaces.Error{
 			Error:      "database_error",
 			Message:    "No se pudieron buscar las solicitudes",
 			StatusCode: http.StatusInternalServerError,
-		}
+		}, 0
 	}
 
-	return results, total, nil
+	return requests, nil, total
 }

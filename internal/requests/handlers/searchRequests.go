@@ -2,7 +2,6 @@ package requests_handlers
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	requests_dto "github.com/tariq-ventura/logistic-service/internal/requests/dto"
@@ -26,7 +25,7 @@ func (rh *RequestHandler) SearchRequests(c *gin.Context) {
 
 	if err := c.ShouldBindJSON(&input); err != nil {
 		rh.logs.LogWarning(
-			"invalid search request",
+			"invalid_search_request",
 			map[string]any{
 				"error": err.Error(),
 			},
@@ -40,36 +39,76 @@ func (rh *RequestHandler) SearchRequests(c *gin.Context) {
 		return
 	}
 
-	input.Query = strings.TrimSpace(input.Query)
-	input.EquipmentType = strings.ToUpper(
-		strings.TrimSpace(input.EquipmentType),
-	)
+	validations.NormalizeSearchInput(&input)
 
-	if input.Page == 0 {
-		input.Page = 1
-	}
-
-	if input.PageSize == 0 {
-		input.PageSize = 20
-	}
-
-	results, total, databaseError := rh.db.SearchRequests(input)
-
-	if databaseError != nil {
-		c.JSON(databaseError.StatusCode, gin.H{
-			"error":   databaseError.Error,
-			"message": databaseError.Message,
+	if validationError := validations.ValidateSearchInput(&input); validationError != nil {
+		c.JSON(validationError.StatusCode, gin.H{
+			"error":   validationError.Error,
+			"message": validationError.Message,
 		})
 		return
 	}
 
-	// Indica que este recurso acepta QUERY con JSON.
+	if input.SemanticQuery != "" {
+		if rh.embeddings == nil {
+			rh.logs.LogError(
+				"embedding_client_not_configured",
+				nil,
+			)
+
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "embedding_service_unavailable",
+				"message": "El proveedor de búsqueda semántica no está configurado",
+			})
+			return
+		}
+
+		embedding, err := rh.embeddings.EmbedQuery(
+			ctx,
+			input.SemanticQuery,
+		)
+
+		if err != nil {
+			rh.logs.LogError(
+				"embedding_service_error",
+				map[string]any{
+					"provider": rh.embeddings.Provider(),
+					"model":    rh.embeddings.Model(),
+					"error":    err.Error(),
+				},
+			)
+
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "embedding_service_unavailable",
+				"message": "No se pudo procesar la búsqueda semántica",
+			})
+			return
+		}
+
+		input.QueryEmbedding = embedding
+		input.EmbeddingProvider = rh.embeddings.Provider()
+		input.EmbeddingModel = rh.embeddings.Model()
+	}
+
+	result, dbError, total := rh.db.SearchRequests(
+		ctx,
+		input,
+	)
+
+	if dbError != nil {
+		c.JSON(dbError.StatusCode, gin.H{
+			"error":   dbError.Error,
+			"message": dbError.Message,
+		})
+		return
+	}
+
 	c.Header("Accept-Query", `"application/json"`)
 
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
 			"count":    total,
-			"requests": results,
+			"requests": result,
 		},
 		"pagination": gin.H{
 			"page":     input.Page,
