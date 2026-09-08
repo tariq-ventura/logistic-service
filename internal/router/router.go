@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	assignmets_db "github.com/tariq-ventura/logistic-service/internal/assigments/db"
 	clients_fleet "github.com/tariq-ventura/logistic-service/internal/clients/fleet"
+	"github.com/tariq-ventura/logistic-service/internal/embeddings"
 	"github.com/tariq-ventura/logistic-service/internal/interfaces"
 	"github.com/tariq-ventura/logistic-service/internal/logging"
 	requets_db "github.com/tariq-ventura/logistic-service/internal/requests/db"
@@ -20,6 +21,7 @@ type Routes struct {
 	Trace         interfaces.ITrace
 	RequestsDB    requets_db.IRequestsDB
 	AssignmentsDB assignmets_db.IAssignmentsDB
+	Embeddings    embeddings.IClient
 }
 
 func (r *Routes) SetupRouter() *gin.Engine {

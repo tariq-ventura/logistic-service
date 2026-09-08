@@ -6,6 +6,7 @@ import (
 
 	clients_fleet "github.com/tariq-ventura/logistic-service/internal/clients/fleet"
 	"github.com/tariq-ventura/logistic-service/internal/database"
+	"github.com/tariq-ventura/logistic-service/internal/embeddings"
 	"github.com/tariq-ventura/logistic-service/internal/interfaces"
 	"github.com/tariq-ventura/logistic-service/internal/logging"
 	"github.com/tariq-ventura/logistic-service/internal/router"
@@ -49,6 +50,15 @@ func runApp(ctx context.Context, l logging.ILogging, t interfaces.ITrace) error 
 	}
 
 	r.FleetClient = clients_fleet.NewClient(fleetServiceURL)
+
+	l.LogInfo("Starting Embedding Clinet", nil)
+	embeddingClient, err := embeddings.SetupEmbedding(ctx, l)
+
+	if err != nil {
+		return err
+	}
+
+	r.Embeddings = embeddingClient
 
 	r.Routes = r.SetupRouter()
 	r.Run()

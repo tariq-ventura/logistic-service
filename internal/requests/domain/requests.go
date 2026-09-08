@@ -10,15 +10,18 @@ import (
 type Request struct {
 	ID uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
 
-	EquipmentType string `json:"equipmentType" gorm:"size:80;not null;index"`
+	EquipmentType string `json:"equipmentType" gorm:"size:30;not null;index"`
 	ProjectName   string `json:"projectName" gorm:"size:150;not null"`
+	LocationName  string `json:"locationName" gorm:"size:200;not null"`
 
-	LocationName string  `json:"locationName" gorm:"size:150;not null"`
-	Latitude     float64 `json:"latitude" gorm:"not null"`
-	Longitude    float64 `json:"longitude" gorm:"not null"`
+	Latitude  float64 `json:"latitude" gorm:"not null"`
+	Longitude float64 `json:"longitude" gorm:"not null"`
 
-	StartDate time.Time `json:"startDate" gorm:"not null;index"`
-	EndDate   time.Time `json:"endDate" gorm:"not null;index"`
+	Description  string `json:"description" gorm:"type:text;not null;default:''"`
+	Requirements string `json:"requirements" gorm:"type:text;not null;default:''"`
+
+	StartDate time.Time `json:"startDate" gorm:"not null"`
+	EndDate   time.Time `json:"endDate" gorm:"not null"`
 
 	Status RequestStatus `json:"status" gorm:"size:30;not null;index"`
 

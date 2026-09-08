@@ -75,6 +75,8 @@ func (rh *RequestHandler) UpdateRequest(c *gin.Context) {
 		return
 	}
 
+	rh.indexRequest(ctx, update)
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Peticion actualizada correctamente",
 		"data":    update,
@@ -114,6 +116,14 @@ func buildUpdates(
 
 	if request.EndDate != nil {
 		updates["end_date"] = request.EndDate.UTC()
+	}
+
+	if request.Description != nil {
+		updates["description"] = strings.TrimSpace(*request.Description)
+	}
+
+	if request.Requirements != nil {
+		updates["requirements"] = strings.TrimSpace(*request.Requirements)
 	}
 
 	return updates

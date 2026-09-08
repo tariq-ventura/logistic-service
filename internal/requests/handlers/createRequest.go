@@ -64,6 +64,9 @@ func (rh *RequestHandler) CreateRequest(c *gin.Context) {
 			request.Location.Name,
 		),
 
+		Description:  request.Description,
+		Requirements: request.Requirements,
+
 		Latitude:  request.Location.Latitude,
 		Longitude: request.Location.Longitude,
 
@@ -94,6 +97,8 @@ func (rh *RequestHandler) CreateRequest(c *gin.Context) {
 		})
 		return
 	}
+
+	rh.indexRequest(ctx, &data)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Peticion registrada correctamente",

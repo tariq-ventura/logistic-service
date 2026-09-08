@@ -6,7 +6,7 @@ import (
 )
 
 func (ro *Routes) RequestsRoutes(r *gin.Engine) {
-	rr := requests_handlers.NewRequestHandler(ro.Context, ro.RequestsDB, ro.Trace, ro.Logging, ro.FleetClient, ro.AssignmentsDB)
+	rr := requests_handlers.NewRequestHandler(ro.Context, ro.RequestsDB, ro.Trace, ro.Logging, ro.FleetClient, ro.AssignmentsDB, ro.Embeddings)
 	routes := r.Group("/api/v1/requests")
 	{
 		routes.POST("", rr.CreateRequest)
