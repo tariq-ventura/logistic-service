@@ -9,6 +9,7 @@ import (
 	"github.com/tariq-ventura/logistic-service/internal/logging"
 	requests_db_postgres "github.com/tariq-ventura/logistic-service/internal/requests/db/postgres"
 	requests_domain "github.com/tariq-ventura/logistic-service/internal/requests/domain"
+	requests_dto "github.com/tariq-ventura/logistic-service/internal/requests/dto"
 	"github.com/tariq-ventura/logistic-service/internal/validations"
 	"gorm.io/gorm"
 )
@@ -18,6 +19,7 @@ type IRequestsDB interface {
 	ListRequests(page, pageSize int) ([]requests_domain.Request, *interfaces.Error, int64)
 	ListRequestById(id uuid.UUID) (*requests_domain.Request, *interfaces.Error)
 	ListRequestStatusHistory(id uuid.UUID) ([]requests_domain.RequestStatusHistory, *interfaces.Error)
+	SearchRequests(input requests_dto.SearchRequestsRequest) ([]requests_dto.SearchRequestResult, int64, *interfaces.Error)
 	UpdateRequest(id uuid.UUID, updates map[string]any) (*requests_domain.Request, *interfaces.Error)
 	UpdateRequestStatus(requestID uuid.UUID, newStatus requests_domain.RequestStatus, reason string) (*requests_domain.Request, *requests_domain.RequestStatusHistory, *interfaces.Error)
 }
