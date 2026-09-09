@@ -11,7 +11,7 @@ func (ro *Routes) RequestsRoutes(r *gin.Engine) {
 	{
 		routes.POST("", rr.CreateRequest)
 		routes.GET("", rr.ListRequests)
-		routes.Handle("QUERY", "", rr.SearchRequests)
+		routes.POST("/search", rr.SearchRequests)
 		routes.GET("/:requestID", rr.ListRequestById)
 		routes.PATCH("/:requestID", rr.UpdateRequest)
 		routes.PATCH("/:requestID/status", rr.UpdateRequestStatus)
