@@ -2,32 +2,15 @@ apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
   name: logistic-service-development
-  namespace: 534053084464
-  selfLink: /apis/serving.knative.dev/v1/namespaces/534053084464/services/logistic-service-development
-  uid: e84c7498-7c76-446d-ae52-77ddf1490a2d
-  resourceVersion: AAZbD6itMhM
-  generation: 8
-  creationTimestamp: "2026-09-09T13:08:54.273477Z"
   labels:
     run.googleapis.com/satisfiesPzs: "true"
     cloud.googleapis.com/location: us-east4
   annotations:
-    serving.knative.dev/creator: tariqventura@gmail.com
-    serving.knative.dev/lastModifier: tariqventura@gmail.com
-    run.googleapis.com/client-name: cloud-console
     run.googleapis.com/ingress: internal-and-cloud-load-balancing
-    run.googleapis.com/operation-id: 22b52477-935d-4798-98dc-d3c14af2f088
-    run.googleapis.com/ingress-status: internal-and-cloud-load-balancing
     run.googleapis.com/invoker-iam-disabled: "true"
-    run.googleapis.com/maxScale: 3
-    run.googleapis.com/urls: "[\"https://logistic-service-development-534053084464.us-east4.run.app\"\
-      ,\"https://logistic-service-development-4tqk6nxafq-uk.a.run.app\"]"
 spec:
   template:
     metadata:
-      labels:
-        client.knative.dev/nonce: 5611e5c6-bd51-468b-81a7-2486d6f0c367
-        run.googleapis.com/startupProbeType: Default
       annotations:
         run.googleapis.com/sessionAffinity: "false"
         run.googleapis.com/vpc-access-egress: all-traffic
@@ -36,7 +19,6 @@ spec:
         autoscaling.knative.dev/maxScale: 3
         run.googleapis.com/network-interfaces: "[{\"network\":\"entropy-vpc-development\"\
           ,\"subnetwork\":\"entropy-subnet-development-01\"}]"
-        run.googleapis.com/client-name: cloud-console
         run.googleapis.com/cpu-throttling: "true"
         run.googleapis.com/startup-cpu-boost: "true"
     spec:
@@ -45,7 +27,7 @@ spec:
       serviceAccountName: fleet-service@minecraft-server-501415.iam.gserviceaccount.com
       containers:
       - name: logistic-service-1
-        image: us-east4-docker.pkg.dev/minecraft-server-501415/development/logistic-service@sha256:97d722ca12a1d6c917b237b28cf44829f83551bb9d688ddab44e95af1ebc0f2d
+        image: container-image-dev
         ports:
         - name: http1
           containerPort: 3001
