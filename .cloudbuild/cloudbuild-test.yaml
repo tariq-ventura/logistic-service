@@ -1,0 +1,29 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+
+steps:
+  - name: 'golang:1.27'
+    id: 'Go Mod Download Logistic Service'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        go mod download
+  
+  - name: 'golang:1.27'
+    id: 'Go Vulnerability Check Logistic Service'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        /go/bin/govulncheck ./...
+
+  - name: gcr.io/cloud-builders/docker
+    id: docker-build-logistic-service
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${SHORT_SHA}
+      - .
