@@ -17,7 +17,7 @@ steps:
     args:
       - '-c'
       - |
-        docker pull "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:latest" || true
+        docker pull "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_DEV_REPOSITORY}/${_IMAGE_NAME}:latest" || true
 
   - name: 'gcr.io/cloud-builders/docker'
     id: 'build-image'
@@ -25,12 +25,12 @@ steps:
       - 'DOCKER_BUILDKIT=1'
     args:
       - 'build'
-      - '--cache-from=${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:latest'
+      - '--cache-from=${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_DEV_REPOSITORY}/${_IMAGE_NAME}:latest'
       - '--build-arg=BUILDKIT_INLINE_CACHE=1'
       - '-t'
-      - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:latest'
+      - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_DEV_REPOSITORY}/${_IMAGE_NAME}:latest'
       - '-t'
-      - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
+      - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_DEV_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
       - '.'
     timeout: '1200s'
     waitFor:
@@ -38,12 +38,12 @@ steps:
 
   - name: 'gcr.io/cloud-builders/docker'
     id: 'push-latest'
-    args: ['push', '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:latest']
+    args: ['push', '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_DEV_REPOSITORY}/${_IMAGE_NAME}:latest']
     waitFor: ['build-image']
 
   - name: 'gcr.io/cloud-builders/docker'
     id: 'push-sha'
-    args: ['push', '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA']
+    args: ['push', '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_DEV_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA']
     waitFor: ['build-image']
 
   - name: 'gcr.io/cloud-builders/gcloud'
@@ -61,7 +61,7 @@ steps:
             --project="${_PROJECT_ID}" \
             --region="${_REGION}" \
             --delivery-pipeline="${_DELIVERY_PIPELINE}" \
-            --images="container-image-dev=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${SHORT_SHA}" \
+            --images="container-image-dev=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_DEV_REPOSITORY}/${_IMAGE_NAME}:${SHORT_SHA},container-image-prod=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${SHORT_SHA}" \
             --source="./" \
             --annotations="commitId=${REVISION_ID}" \
             --skaffold-file="cdeploy/skaffold.yaml" \

@@ -9,3 +9,55 @@ profiles:
       - manifests/dev.yaml
     deploy:
       cloudrun: {}
+  - name: prod
+    manifests:
+      rawYaml:
+      - manifests/prod.yaml
+    deploy:
+      cloudrun: {}
+    customActions:
+      - name: re-tag-push-prod
+        containers:
+          - name: prod-pusher
+            image: us-east4-docker.pkg.dev/minecraft-server-501415/devops/image-promoter:v1.0.0
+            command: ["/bin/sh"]
+            args:
+              - "-c"
+              - |
+                set -e
+
+                RELEASE_NAME="${RELEASE}"
+                PIPELINE_NAME="${CLOUD_DEPLOY_DELIVERY_PIPELINE}"
+                LOCATION="${CLOUD_DEPLOY_LOCATION}"
+                PROJECT="${CLOUD_DEPLOY_PROJECT_ID}"
+
+                echo "===== Getting Release information ====="
+                START=$(date +%s)
+
+                RELEASE_INFO=$(gcloud deploy releases describe "${RELEASE_NAME}" \
+                  --delivery-pipeline="${PIPELINE_NAME}" \
+                  --project="${PROJECT}" \
+                  --region="${LOCATION}" \
+                  --format="json")
+
+                END=$(date +%s)
+                echo "Release describe: $((END - START)) seconds"
+
+                SOURCE_IMAGE=$(echo "${RELEASE_INFO}" | jq -r \
+                  '.buildArtifacts[] | select(.image == "container-image-dev") | .tag')
+
+                PROD_IMAGE=$(echo "${RELEASE_INFO}" | jq -r \
+                  '.buildArtifacts[] | select(.image == "container-image-prod") | .tag')
+
+                echo "DEV_IMAGE:  ${SOURCE_IMAGE}"
+                echo "PROD_IMAGE: ${PROD_IMAGE}"
+
+                echo "===== Copying image ====="
+                START=$(date +%s)
+
+                gcrane cp "${SOURCE_IMAGE}" "${PROD_IMAGE}"
+
+                END=$(date +%s)
+                echo "Image copy: $((END - START)) seconds"
+
+                echo "✅ Promoted image to PROD"
