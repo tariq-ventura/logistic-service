@@ -6,3 +6,9 @@ serialPipeline:
   stages:
     - targetId: dev-target
       profiles: [dev]
+    - targetId: prod-target
+      profiles: [prod]
+      strategy:
+        standard:
+          predeploy:
+            actions: ["re-tag-push-prod"]
