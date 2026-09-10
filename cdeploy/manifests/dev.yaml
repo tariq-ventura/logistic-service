@@ -48,6 +48,8 @@ spec:
           value: us-east4
         - name: EMBEDDING_MODEL
           value: text-multilingual-embedding-002
+        - name: LOGGING_TYPE
+          value: GCP
         - name: FLEET_SERVICE_URL
           value: https://fleet-service-development-534053084464.us-east4.run.app
         - name: DB_STRING

@@ -3,6 +3,7 @@ package database_postgres
 import (
 	"context"
 
+	assignments_domain "github.com/tariq-ventura/logistic-service/internal/assigments/domain"
 	requests_domain "github.com/tariq-ventura/logistic-service/internal/requests/domain"
 )
 
@@ -16,6 +17,7 @@ func (pc *PostgresClient) MigrateDatabase(ctx context.Context) error {
 	if err := pc.Client.WithContext(ctx).AutoMigrate(
 		&requests_domain.Request{},
 		&requests_domain.RequestStatusHistory{},
+		&assignments_domain.Assignment{},
 	); err != nil {
 		return err
 	}
