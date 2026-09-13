@@ -12,6 +12,9 @@ type Request struct {
 	Project   string         `json:"project" gorm:"size:250;not null;index"`
 	Type      string         `json:"type" gorm:"size:100;not null;index"`
 	Requester string         `json:"requester" gorm:"size:200;not null;index"`
+	Location  string         `json:"location" gorm:"size:250;index"`
+	Latitude  float64        `json:"latitude" gorm:"type:numeric(10,7)"`
+	Longitude float64        `json:"longitude" gorm:"type:numeric(10,7)"`
 	StartDate time.Time      `json:"startDate" gorm:"not null"`
 	EndDate   time.Time      `json:"endDate" gorm:"not null"`
 	Status    RequestStatus  `json:"status" gorm:"size:30;not null;index"`
