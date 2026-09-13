@@ -6,18 +6,18 @@ import (
 )
 
 func (ro *Routes) RequestsRoutes(r *gin.Engine) {
-	rr := requests_handlers.NewRequestHandler(ro.Context, ro.RequestsDB, ro.Trace, ro.Logging, ro.FleetClient, ro.AssignmentsDB, ro.Embeddings)
+	h := requests_handlers.NewRequestHandler(ro.Context, ro.RequestsDB, ro.Trace, ro.Logging)
 	routes := r.Group("/api/v1/requests")
 	{
-		routes.POST("", rr.CreateRequest)
-		routes.GET("", rr.ListRequests)
-		routes.POST("/search", rr.SearchRequests)
-		routes.GET("/:requestID", rr.ListRequestById)
-		routes.PATCH("/:requestID", rr.UpdateRequest)
-		routes.PATCH("/:requestID/status", rr.UpdateRequestStatus)
-		routes.GET("/:requestID/status-history", rr.ListRequestStatusHistory)
-		routes.GET("/:requestID/recommendations", rr.ListRequestRecommendations)
-		routes.GET("/:requestID/assignment", rr.ListAssginmentByRequest)
-		routes.POST("/:requestID/assignment", rr.CreateAssignment)
+		routes.POST("", h.CreateRequest)
+		routes.GET("", h.ListRequests)
+		routes.POST("/search", h.SearchRequests)
+		routes.GET("/:requestID", h.ListRequestById)
+		routes.PATCH("/:requestID", h.UpdateRequest)
+		routes.DELETE("/:requestID", h.RemoveRequest)
+		routes.PATCH("/:requestID/status", h.UpdateRequestStatus)
+		routes.GET("/:requestID/status-history", h.ListRequestStatusHistory)
+		routes.PATCH("/:requestID/assignment", h.AssignMachinery)
+		routes.DELETE("/:requestID/assignment", h.ReleaseMachinery)
 	}
 }
