@@ -1,13 +1,17 @@
 # Logistic Service
 
-Microservicio encargado de administrar **solicitudes logísticas de maquinaria pesada**, controlar su ciclo de vida y generar **recomendaciones de maquinaria disponible** consultando a `fleet-service`.
+Microservicio que administra el inventario de **maquinaria Prisma** y las **solicitudes de maquinaria** de los proyectos, junto con su asignación, liberación e historial de estados.
 
-El servicio forma parte de una arquitectura de microservicios en la que:
+El servicio forma parte de la plataforma Entropy, en la que:
 
-- `logistic-service` administra las solicitudes de maquinaria para proyectos.
-- `fleet-service` administra la flota y el estado operativo de cada equipo.
-- PostgreSQL almacena las solicitudes y su historial de cambios de estado.
-- El motor de recomendaciones cruza la ubicación y tipo requerido con los equipos disponibles de `fleet-service`.
+- `logistic-service` administra la maquinaria Prisma y las solicitudes de los proyectos.
+- `fleet-service` administra los vehículos, tareas, mantenimientos y geocercas de Startrack.
+- `mcp-server` construye la proyección unificada que correlaciona ambos inventarios.
+- PostgreSQL almacena la maquinaria, las solicitudes y su historial de cambios de estado.
+
+Está desarrollado en **Go**, expone una API HTTP con **Gin**, utiliza **PostgreSQL** mediante **GORM** y cuenta con instrumentación de observabilidad basada en **OpenTelemetry**.
+
+> **Cambio importante:** el motor de recomendaciones y toda la integración HTTP hacia `fleet-service` fueron retirados. Este servicio ya no consulta a Fleet ni requiere `FLEET_SERVICE_URL`. La asignación de maquinaria ahora se resuelve internamente contra la tabla `prisma_machinery`.
 
 ## Tabla de contenido
 
@@ -18,12 +22,16 @@ El servicio forma parte de una arquitectura de microservicios en la que:
 - [Variables de entorno](#variables-de-entorno)
 - [Levantar el proyecto localmente](#levantar-el-proyecto-localmente)
 - [Modelo de dominio](#modelo-de-dominio)
-- [Estados de una solicitud](#estados-de-una-solicitud)
+- [Estados](#estados)
 - [Endpoints](#endpoints)
+- [API de maquinaria](#api-de-maquinaria)
+- [API de solicitudes](#api-de-solicitudes)
+- [Asignación de maquinaria](#asignación-de-maquinaria)
 - [Casos de uso](#casos-de-uso)
-- [Motor de recomendaciones](#motor-de-recomendaciones)
-- [Integración con Fleet Service](#integración-con-fleet-service)
+- [Carga de datos sintéticos](#carga-de-datos-sintéticos)
+- [Manejo de errores](#manejo-de-errores)
 - [Observabilidad](#observabilidad)
+- [CORS](#cors)
 - [Pruebas](#pruebas)
 - [Estructura del proyecto](#estructura-del-proyecto)
 - [Notas conocidas de la implementación](#notas-conocidas-de-la-implementación)
@@ -34,26 +42,30 @@ El servicio forma parte de una arquitectura de microservicios en la que:
 
 Actualmente `logistic-service` permite:
 
-- crear solicitudes logísticas;
-- consultar solicitudes;
-- actualizar solicitudes mientras estén en estado `PENDING`;
-- controlar el estado de una solicitud mediante transiciones válidas;
-- almacenar el historial de cambios de estado;
-- consultar maquinaria disponible en `fleet-service`;
-- calcular un ranking de recomendaciones por solicitud;
+- registrar maquinaria Prisma con su número de activo, clase y estado;
+- consultar maquinaria con paginación, filtros y búsqueda libre;
+- actualizar los datos maestros de una maquinaria;
+- cambiar el estado operativo de una maquinaria;
+- eliminar maquinaria mediante borrado lógico;
+- crear solicitudes de maquinaria para proyectos;
+- consultar y listar solicitudes con filtros y paginación;
+- realizar búsquedas avanzadas por múltiples estados mediante `POST /requests/search`;
+- actualizar solicitudes mientras estén en estado `Pendiente`;
+- eliminar solicitudes pendientes sin maquinaria asignada;
+- asignar una maquinaria a una solicitud de forma transaccional;
+- liberar la maquinaria asignada y devolver la solicitud a `Pendiente`;
+- almacenar el historial de cambios de estado de cada solicitud;
 - exponer health check HTTP;
-- enviar trazas mediante OpenTelemetry;
 - utilizar logging local o Google Cloud Logging/Error Reporting.
 
 ---
 
 ## Arquitectura
 
-Flujo simplificado:
-
 ```text
                   +----------------------+
                   |      Cliente / UI    |
+                  |     n8n / MCP        |
                   +----------+-----------+
                              |
                              | HTTP REST
@@ -63,54 +75,55 @@ Flujo simplificado:
                   |       Go + Gin       |
                   +----+------------+----+
                        |            |
-                       |            | HTTP REST
-                       |            v
-                       |     +------------------+
-                       |     |  fleet-service   |
-                       |     | maquinaria/flota |
-                       |     +------------------+
-                       |
-                       | GORM
-                       v
-                 +-------------+
-                 | PostgreSQL  |
-                 +-------------+
+                       | GORM       | GORM
+                       v            v
+              +----------------+  +--------------------------+
+              | prisma_machinery|  | prisma_machinery_requests|
+              +----------------+  +--------------------------+
+                                        |
+                                        v
+                          +-------------------------------+
+                          | prisma_request_status_history  |
+                          +-------------------------------+
 ```
 
-Para generar recomendaciones el flujo es:
+La asignación de maquinaria ocurre en una sola transacción de PostgreSQL que toca las tres tablas:
 
 ```text
-GET /requests/{id}/recommendations
+PATCH /requests/{id}/assignment
             |
             v
-Buscar solicitud en PostgreSQL
+SELECT ... FOR UPDATE sobre la solicitud
             |
             v
-¿Estado PENDING?
-     |             |
-    no            sí
-     |             |
-    409            v
-              Consultar Fleet
-                    |
-                    v
-          Equipos AVAILABLE del tipo
-                    |
-                    v
-            Filtrar candidatos
-                    |
-                    v
-      Calcular distancia + mantenimiento
-              + combustible
-                    |
-                    v
-              Calcular score
-                    |
-                    v
-          Ordenar y responder 200
+SELECT ... FOR UPDATE sobre la maquinaria
+            |
+            v
+¿Solicitud Pendiente?  ──no──> 409 assignment_conflict
+            |sí
+            v
+¿Maquinaria Disponible? ──no──> 409 assignment_conflict
+            |sí
+            v
+¿type == equipmentClass? ──no──> 409 assignment_conflict
+            |sí
+            v
+Solicitud: machinery = assetNumber, status = Aprobada
+Maquinaria: status = Ocupada
+Historial: Pendiente -> Aprobada
+            |
+            v
+          200 OK
 ```
 
-El repositorio incluye una explicación más detallada en [`recommendation-algorithm.md`](recommendation-algorithm.md) y su diagrama en [`recommendation-algorithm.png`](recommendation-algorithm.png).
+Cada módulo de dominio sigue la misma estructura de cuatro capas:
+
+```text
+domain/    Modelo GORM, enums y nombre de tabla
+dto/       Contratos de entrada y sus validaciones
+db/        Interfaz de persistencia + implementación PostgreSQL
+handlers/  Adaptadores HTTP de Gin
+```
 
 ---
 
@@ -121,10 +134,10 @@ El repositorio incluye una explicación más detallada en [`recommendation-algor
 | Tecnología | Uso |
 |---|---|
 | Go 1.27 | Lenguaje principal |
-| Gin | API HTTP REST |
-| GORM | ORM y acceso a PostgreSQL |
+| Gin 1.12 | API HTTP REST |
+| GORM 1.31 | ORM y acceso a PostgreSQL |
 | PostgreSQL 17 | Persistencia |
-| UUID | Identificadores de entidades |
+| Google UUID | Identificadores de entidades |
 
 ### Observabilidad
 
@@ -154,12 +167,11 @@ Para ejecución local directa:
 
 - Go `1.27` compatible con el `go.mod`;
 - PostgreSQL;
-- una instancia accesible de `fleet-service` para el arranque y las recomendaciones;
-- `curl` y `jq` si se ejecutará el script de pruebas.
+- `curl` y `jq` si se ejecutarán scripts de prueba o de carga de datos.
 
 Alternativamente se puede utilizar Docker y Docker Compose.
 
-> `logistic-service` depende de `fleet-service`. La variable `FLEET_SERVICE_URL` es obligatoria durante el arranque aunque solamente se quieran probar los endpoints CRUD de solicitudes.
+> Este servicio ya **no** depende de `fleet-service` en tiempo de arranque ni de ejecución. Puede levantarse de forma completamente independiente.
 
 ---
 
@@ -169,7 +181,6 @@ Alternativamente se puede utilizar Docker y Docker Compose.
 |---|---:|---|---|
 | `DB_CONTEXT` | Sí | `postgresql` | Backend de base de datos. Actualmente solo PostgreSQL está implementado. |
 | `DB_STRING` | Sí | `host=localhost user=mongo password=1234 dbname=backend_golang_gin port=5435 sslmode=disable` | DSN de PostgreSQL. |
-| `FLEET_SERVICE_URL` | Sí | `http://localhost:3000` | URL base de `fleet-service`, sin `/api/v1`. |
 | `TRACE_TYPE` | Sí | `STDOUT` | Exportador de trazas: `STDOUT`, `OTLP`, `GCP`, `NONE` o `DISABLED`. |
 | `SERVICE_NAME` | Sí | `logistic-service` | Nombre utilizado por OpenTelemetry. |
 | `PORT` | No | `3001` | Puerto HTTP. Por defecto `3001`. |
@@ -177,10 +188,12 @@ Alternativamente se puede utilizar Docker y Docker Compose.
 | `SERVICE_VERSION` | No | `0.1.0` | Versión agregada al recurso OpenTelemetry. |
 | `ENVIRONMENT` | No | `local` | Ambiente agregado a las trazas. |
 | `GCP_PROJECT_ID` | Solo GCP | `my-project` | Proyecto utilizado por logging/tracing en Google Cloud. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Solo OTLP/GCP personalizado | `collector:4317` | Endpoint OTLP general. |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Solo OTLP/GCP personalizado | — | Endpoint específico de trazas OTLP. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Solo OTLP | `collector:4317` | Endpoint OTLP general. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Solo OTLP | — | Endpoint específico de trazas OTLP. |
 
-Las variables `DB_USER`, `DB_PASS` y `DB_NAME` del `.env.example` son utilizadas principalmente para inicializar PostgreSQL desde Docker Compose.
+Las variables `DB_USER`, `DB_PASS` y `DB_NAME` del `.env.example` se utilizan principalmente para inicializar PostgreSQL desde Docker Compose.
+
+> `FLEET_SERVICE_URL` ya no se lee en ninguna parte del código. Sigue declarada en los manifiestos de `cdeploy/`, donde puede retirarse.
 
 ### Ejemplo recomendado para desarrollo
 
@@ -190,8 +203,6 @@ DB_PASS=1234
 DB_NAME=backend_golang_gin
 DB_CONTEXT=postgresql
 DB_STRING=host=localhost user=mongo password=1234 dbname=backend_golang_gin port=5435 sslmode=disable
-
-FLEET_SERVICE_URL=http://localhost:3000
 
 TRACE_TYPE=STDOUT
 SERVICE_NAME=logistic-service
@@ -206,8 +217,6 @@ PORT=3001
 ## Levantar el proyecto localmente
 
 ### Opción 1: Go + PostgreSQL en Docker
-
-Esta opción es útil cuando `fleet-service` ya está ejecutándose en `localhost:3000`.
 
 #### 1. Crear PostgreSQL
 
@@ -225,8 +234,6 @@ docker run --name logistic-postgres \
 ```bash
 export DB_CONTEXT=postgresql
 export DB_STRING='host=localhost user=mongo password=1234 dbname=backend_golang_gin port=5435 sslmode=disable'
-
-export FLEET_SERVICE_URL='http://localhost:3000'
 
 export TRACE_TYPE=STDOUT
 export SERVICE_NAME=logistic-service
@@ -261,6 +268,8 @@ La API quedará disponible en:
 http://localhost:3001
 ```
 
+Al iniciar, GORM ejecuta `AutoMigrate` para las tres tablas del servicio.
+
 #### 5. Health check
 
 ```bash
@@ -279,13 +288,7 @@ Respuesta esperada:
 
 ### Opción 2: Docker Compose
 
-El repositorio contiene un `docker-compose.yml`, pero la versión actual requiere algunos ajustes para ejecutar el servicio correctamente de forma standalone:
-
-1. PostgreSQL escucha internamente en `5432`, no en `5434`.
-2. `FLEET_SERVICE_URL` es requerida por la aplicación y actualmente no se pasa al contenedor.
-3. `fleet-service` debe ser alcanzable desde el contenedor de Logistics.
-
-Un ejemplo mínimo de la parte relevante sería:
+El repositorio contiene un `docker-compose.yml`, pero la versión actual publica PostgreSQL como `5435:5434` cuando el contenedor escucha internamente en `5432`. Un ejemplo mínimo corregido de la parte relevante:
 
 ```yaml
 services:
@@ -305,16 +308,9 @@ services:
     environment:
       DB_STRING: "host=postgres user=${DB_USER} password=${DB_PASS} dbname=${DB_NAME} port=5432 sslmode=disable"
       DB_CONTEXT: postgresql
-      FLEET_SERVICE_URL: ${FLEET_SERVICE_URL}
       TRACE_TYPE: ${TRACE_TYPE}
       SERVICE_NAME: logistic-service
       PORT: "3001"
-```
-
-Si ambos microservicios se levantan desde un Compose padre y el servicio se llama `fleet-service`, la URL recomendada es:
-
-```env
-FLEET_SERVICE_URL=http://fleet-service:3000
 ```
 
 Luego:
@@ -327,80 +323,143 @@ docker compose up --build
 
 ## Modelo de dominio
 
-Una solicitud logística se almacena en la tabla `logistics_requests`.
+### Maquinaria
 
-Ejemplo conceptual:
+Tabla `prisma_machinery`.
+
+```json
+{
+  "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+  "company": "ECON",
+  "assetNumber": "SYN-DEMO-01",
+  "name": "Excavadora hidráulica 320",
+  "equipmentClass": "Excavadora",
+  "status": "Disponible",
+  "createdAt": "2026-09-13T20:00:00Z",
+  "updatedAt": "2026-09-13T20:00:00Z"
+}
+```
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `id` | UUID | Generado por el servicio |
+| `company` | string | Empresa propietaria |
+| `assetNumber` | string | Número de activo. **Único** |
+| `name` | string | Nombre descriptivo |
+| `equipmentClass` | string | Clase de maquinaria. Debe coincidir con el `type` de la solicitud para poder asignarla |
+| `status` | enum | Ver [Estados](#estados) |
+
+### Solicitud
+
+Tabla `prisma_machinery_requests`.
 
 ```json
 {
   "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
-  "equipmentType": "EXCAVATOR",
-  "projectName": "Construcción tramo norte",
-  "locationName": "San Miguel",
-  "latitude": 13.4833,
-  "longitude": -88.1833,
-  "startDate": "2030-09-10T08:00:00Z",
-  "endDate": "2030-09-15T18:00:00Z",
-  "status": "PENDING",
-  "createdAt": "2030-08-20T15:40:00Z",
-  "updatedAt": "2030-08-20T15:40:00Z"
+  "project": "Ampliación carretera Los Chorros",
+  "type": "Excavadora",
+  "requester": "Gerencia Técnica",
+  "location": "",
+  "latitude": 0,
+  "longitude": 0,
+  "startDate": "2030-01-10T08:00:00Z",
+  "endDate": "2030-01-25T17:00:00Z",
+  "status": "Pendiente",
+  "createdAt": "2026-09-13T20:00:00Z",
+  "updatedAt": "2026-09-13T20:00:00Z"
 }
 ```
 
-El historial se almacena en `request_status_history`.
+| Campo | Tipo | Notas |
+|---|---|---|
+| `id` | UUID | Generado por el servicio |
+| `project` | string | Nombre del proyecto |
+| `type` | string | Clase de maquinaria requerida |
+| `requester` | string | Área o persona solicitante |
+| `location` | string | Ubicación textual. Ver [Notas conocidas](#notas-conocidas-de-la-implementación) |
+| `latitude` | float | Grados decimales. Ver [Notas conocidas](#notas-conocidas-de-la-implementación) |
+| `longitude` | float | Grados decimales. Ver [Notas conocidas](#notas-conocidas-de-la-implementación) |
+| `startDate` | fecha | RFC 3339, almacenada en UTC |
+| `endDate` | fecha | Debe ser posterior a `startDate` |
+| `status` | enum | `Pendiente` o `Aprobada` |
+| `machinery` | string, nullable | `assetNumber` de la maquinaria asignada. Se omite cuando es nulo |
+
+> `machinery` guarda el **número de activo** en texto, no el UUID de la maquinaria. No existe llave foránea entre ambas tablas.
+
+### Historial de estados
+
+Tabla `prisma_request_status_history`.
 
 ```json
 {
   "id": "5f37962e-d2ad-44ad-8388-f76978fda8ad",
   "requestId": "d00271c7-6553-4461-97e2-ab6f5132b057",
-  "fromStatus": "PENDING",
-  "toStatus": "ASSIGNED",
+  "fromStatus": "Pendiente",
+  "toStatus": "Aprobada",
   "reason": "Maquinaria confirmada para la solicitud",
-  "changedAt": "2030-08-21T10:30:00Z"
+  "changedAt": "2026-09-13T21:00:00Z"
 }
 ```
 
-GORM ejecuta `AutoMigrate` al iniciar para:
-
-- `logistics_requests`;
-- `request_status_history`.
-
 ---
 
-## Estados de una solicitud
+## Estados
 
-Estados válidos:
+### Estados de la maquinaria
 
-| Estado | Significado |
+| Valor | Significado |
 |---|---|
-| `PENDING` | Solicitud creada y pendiente de asignación. |
-| `ASSIGNED` | La solicitud ya tiene una asignación operacional. |
-| `COMPLETED` | Trabajo finalizado. Estado terminal. |
-| `CANCELLED` | Solicitud cancelada. Estado terminal. |
+| `Disponible` | Libre para ser asignada. Valor por defecto al crear |
+| `Ocupada` | Asignada a una solicitud aprobada |
+| `Mant. preventivo` | En mantenimiento programado |
+| `Mant. correctivo` | En reparación |
+| `Obsoletas` | Fuera de servicio |
+
+El servicio normaliza los valores recibidos, sin distinguir mayúsculas:
+
+```text
+"disponible" | "available"                      -> Disponible
+"ocupada" | "ocupado" | "occupied"              -> Ocupada
+"mant. preventivo" | "mantenimiento preventivo" -> Mant. preventivo
+"mant. correctivo" | "mantenimiento correctivo" -> Mant. correctivo
+"obsoletas" | "obsoleta" | "obsolete"           -> Obsoletas
+```
+
+Cualquier otro valor responde `400 invalid_status`.
+
+### Estados de la solicitud
+
+Solo existen dos:
+
+| Valor | Significado |
+|---|---|
+| `Pendiente` | Solicitud creada, sin maquinaria asignada. Valor por defecto al crear |
+| `Aprobada` | Solicitud con maquinaria asignada |
+
+Normalización aceptada:
+
+```text
+"pendiente" | "pending"                 -> Pendiente
+"aprobada" | "aprobado" | "approved"    -> Aprobada
+```
 
 ### Transiciones permitidas
 
 ```text
-PENDING ───────> ASSIGNED ───────> COMPLETED
-   │                │
-   │                └────────────> CANCELLED
-   │
-   └─────────────────────────────> CANCELLED
+Pendiente <────────> Aprobada
 ```
 
-Tabla:
+Ambas direcciones son válidas. Las reglas adicionales son:
 
-| Estado actual | Estado siguiente | Permitido |
-|---|---|---:|
-| `PENDING` | `ASSIGNED` | Sí |
-| `PENDING` | `CANCELLED` | Sí |
-| `PENDING` | `COMPLETED` | No |
-| `ASSIGNED` | `COMPLETED` | Sí |
-| `ASSIGNED` | `CANCELLED` | Sí |
-| `COMPLETED` | Cualquier otro | No |
-| `CANCELLED` | Cualquier otro | No |
+| Desde | Hacia | Condición |
+|---|---|---|
+| `Pendiente` | `Aprobada` | La solicitud ya debe tener `machinery` asignada |
+| `Aprobada` | `Pendiente` | Libera la maquinaria: la deja en `Disponible` y pone `machinery` en `null` |
+| Cualquiera | El mismo estado | Rechazado |
 
-Cada transición válida crea un registro en `request_status_history`.
+> Los estados `ASSIGNED`, `COMPLETED` y `CANCELLED` de la versión anterior ya no existen. La cancelación de una asignación se modela liberando la maquinaria.
+
+Cada transición válida crea un registro en `prisma_request_status_history`.
 
 ---
 
@@ -423,21 +482,26 @@ http://localhost:3001/api/v1
 | Método | Endpoint | Descripción |
 |---|---|---|
 | `GET` | `/health` | Health check |
+| `POST` | `/api/v1/equipments` | Registrar maquinaria |
+| `GET` | `/api/v1/equipments` | Listar y filtrar maquinaria |
+| `GET` | `/api/v1/equipments/:id` | Consultar maquinaria |
+| `PATCH` | `/api/v1/equipments/:id` | Actualizar datos maestros |
+| `PATCH` | `/api/v1/equipments/:id/status` | Cambiar estado de la maquinaria |
+| `DELETE` | `/api/v1/equipments/:id` | Eliminar maquinaria |
 | `POST` | `/api/v1/requests` | Crear solicitud |
-| `GET` | `/api/v1/requests` | Listar solicitudes |
+| `GET` | `/api/v1/requests` | Listar y filtrar solicitudes |
+| `POST` | `/api/v1/requests/search` | Búsqueda avanzada |
 | `GET` | `/api/v1/requests/:requestID` | Consultar solicitud |
-| `PATCH` | `/api/v1/requests/:requestID` | Modificar una solicitud `PENDING` |
+| `PATCH` | `/api/v1/requests/:requestID` | Modificar una solicitud `Pendiente` |
+| `DELETE` | `/api/v1/requests/:requestID` | Eliminar una solicitud `Pendiente` sin maquinaria |
 | `PATCH` | `/api/v1/requests/:requestID/status` | Cambiar estado |
 | `GET` | `/api/v1/requests/:requestID/status-history` | Consultar historial |
-| `GET` | `/api/v1/requests/:requestID/recommendations` | Generar recomendaciones |
+| `PATCH` | `/api/v1/requests/:requestID/assignment` | Asignar maquinaria |
+| `DELETE` | `/api/v1/requests/:requestID/assignment` | Liberar maquinaria |
 
 ---
 
 ## GET `/health`
-
-Verifica que el proceso HTTP esté disponible.
-
-### Request
 
 ```bash
 curl http://localhost:3001/health
@@ -453,27 +517,23 @@ curl http://localhost:3001/health
 
 ---
 
-## POST `/api/v1/requests`
+# API de maquinaria
 
-Crea una nueva solicitud logística.
+## POST `/api/v1/equipments`
 
-El estado inicial siempre es `PENDING` y `equipmentType` se almacena en mayúsculas.
+Registra una maquinaria en el inventario Prisma.
 
 ### Request
 
 ```bash
-curl -X POST http://localhost:3001/api/v1/requests \
+curl -X POST http://localhost:3001/api/v1/equipments \
   -H 'Content-Type: application/json' \
   -d '{
-    "equipmentType": "EXCAVATOR",
-    "projectName": "Proyecto San Miguel",
-    "location": {
-      "name": "San Miguel",
-      "latitude": 13.4833,
-      "longitude": -88.1833
-    },
-    "startDate": "2030-09-10T08:00:00Z",
-    "endDate": "2030-09-15T18:00:00Z"
+    "company": "ECON",
+    "assetNumber": "SYN-DEMO-01",
+    "name": "Excavadora hidráulica 320",
+    "equipmentClass": "Excavadora",
+    "status": "Disponible"
   }'
 ```
 
@@ -481,76 +541,64 @@ curl -X POST http://localhost:3001/api/v1/requests \
 
 | Campo | Tipo | Requerido | Validación |
 |---|---|---:|---|
-| `equipmentType` | string | Sí | No vacío |
-| `projectName` | string | Sí | No vacío |
-| `location.name` | string | Sí | No vacío |
-| `location.latitude` | number | Sí* | `-90` a `90` |
-| `location.longitude` | number | Sí* | `-180` a `180` |
-| `startDate` | RFC3339 datetime | Sí | Fecha válida |
-| `endDate` | RFC3339 datetime | Sí | Debe ser posterior a `startDate` |
-
-`latitude` y `longitude` son valores numéricos y `0` es aceptado por las validaciones actuales.
+| `company` | string | Sí | Máximo 150 caracteres |
+| `assetNumber` | string | Sí | Máximo 200 caracteres. Único |
+| `name` | string | Sí | Máximo 200 caracteres |
+| `equipmentClass` | string | Sí | Máximo 100 caracteres |
+| `status` | string | No | Uno de los estados válidos. Si se omite, `Disponible` |
 
 ### `201 Created`
 
 ```json
 {
-  "message": "Peticion registrada correctamente",
+  "message": "Maquinaria registrada correctamente",
   "data": {
-    "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
-    "equipmentType": "EXCAVATOR",
-    "projectName": "Proyecto San Miguel",
-    "locationName": "San Miguel",
-    "latitude": 13.4833,
-    "longitude": -88.1833,
-    "startDate": "2030-09-10T08:00:00Z",
-    "endDate": "2030-09-15T18:00:00Z",
-    "status": "PENDING"
+    "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+    "company": "ECON",
+    "assetNumber": "SYN-DEMO-01",
+    "name": "Excavadora hidráulica 320",
+    "equipmentClass": "Excavadora",
+    "status": "Disponible",
+    "createdAt": "2026-09-13T20:00:00Z",
+    "updatedAt": "2026-09-13T20:00:00Z"
   }
 }
 ```
 
 ### `400 Bad Request`
 
-Body inválido o campos requeridos faltantes:
-
 ```json
 {
-  "error": "invalid_request",
-  "message": "Los datos enviados no son válidos",
-  "detail": "..."
+  "error": "invalid_status",
+  "message": "El estado de maquinaria no es válido"
 }
 ```
 
-### `422 Unprocessable Entity`
-
-Si `endDate <= startDate`:
+### `409 Conflict`
 
 ```json
 {
-  "error": "endDate must be after startDate"
+  "error": "equipment_already_exists",
+  "message": "Ya existe una maquinaria con ese número de activo"
 }
 ```
 
 ---
 
-## GET `/api/v1/requests`
-
-Lista solicitudes con paginación, ordenadas por `created_at DESC`.
+## GET `/api/v1/equipments`
 
 ### Query parameters
 
 | Parámetro | Default | Descripción |
 |---|---:|---|
 | `page` | `1` | Página actual |
-| `pageSize` | `20` | Registros solicitados por página |
-
-El acceso a base de datos limita internamente `pageSize` a un máximo de `100`.
-
-### Request
+| `pageSize` | `20` | Registros por página; máximo efectivo `100` |
+| `equipmentClass` | — | Coincidencia exacta, sin distinguir mayúsculas |
+| `status` | — | Coincidencia exacta, sin distinguir mayúsculas |
+| `search` | — | Busca en `company`, `assetNumber`, `name` y `equipmentClass` |
 
 ```bash
-curl 'http://localhost:3001/api/v1/requests?page=1&pageSize=20'
+curl 'http://localhost:3001/api/v1/equipments?equipmentClass=Excavadora&status=Disponible&search=SYN-DEMO'
 ```
 
 ### `200 OK`
@@ -559,15 +607,12 @@ curl 'http://localhost:3001/api/v1/requests?page=1&pageSize=20'
 {
   "data": [
     {
-      "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
-      "equipmentType": "EXCAVATOR",
-      "projectName": "Proyecto San Miguel",
-      "locationName": "San Miguel",
-      "latitude": 13.4833,
-      "longitude": -88.1833,
-      "startDate": "2030-09-10T08:00:00Z",
-      "endDate": "2030-09-15T18:00:00Z",
-      "status": "PENDING"
+      "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+      "company": "ECON",
+      "assetNumber": "SYN-DEMO-01",
+      "name": "Excavadora hidráulica 320",
+      "equipmentClass": "Excavadora",
+      "status": "Disponible"
     }
   ],
   "pagination": {
@@ -579,36 +624,14 @@ curl 'http://localhost:3001/api/v1/requests?page=1&pageSize=20'
 }
 ```
 
-> Actualmente este endpoint no implementa filtros por estado, tipo de maquinaria, proyecto o fechas.
+Los resultados se ordenan por `createdAt` descendente.
 
 ---
 
-## GET `/api/v1/requests/:requestID`
-
-Consulta una solicitud por UUID.
-
-### Request
+## GET `/api/v1/equipments/:id`
 
 ```bash
-curl http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057
-```
-
-### `200 OK`
-
-```json
-{
-  "data": {
-    "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
-    "equipmentType": "EXCAVATOR",
-    "projectName": "Proyecto San Miguel",
-    "locationName": "San Miguel",
-    "latitude": 13.4833,
-    "longitude": -88.1833,
-    "startDate": "2030-09-10T08:00:00Z",
-    "endDate": "2030-09-15T18:00:00Z",
-    "status": "PENDING"
-  }
-}
+curl http://localhost:3001/api/v1/equipments/7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d
 ```
 
 ### `400 Bad Request`
@@ -624,57 +647,40 @@ curl http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057
 
 ```json
 {
-  "error": "request_not_found",
-  "message": "La peticion no existe"
+  "error": "equipment_not_found",
+  "message": "La maquinaria no existe"
 }
 ```
 
 ---
 
-## PATCH `/api/v1/requests/:requestID`
+## PATCH `/api/v1/equipments/:id`
 
-Actualiza parcialmente una solicitud.
+Actualiza los datos maestros. **No** modifica el estado; para eso existe `/status`.
 
-Solo se pueden modificar solicitudes cuyo estado actual sea `PENDING`.
+Campos admitidos:
 
-### Campos admitidos
-
-```json
-{
-  "equipmentType": "BULLDOZER",
-  "projectName": "Proyecto actualizado",
-  "location": {
-    "name": "Santa Ana",
-    "latitude": 13.9942,
-    "longitude": -89.5597
-  },
-  "startDate": "2030-10-01T08:00:00Z",
-  "endDate": "2030-10-05T18:00:00Z"
-}
+```text
+company
+assetNumber
+name
+equipmentClass
 ```
 
-Todos los campos son opcionales, pero debe enviarse al menos uno.
-
-### Ejemplo
-
 ```bash
-curl -X PATCH \
-  http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057 \
+curl -X PATCH http://localhost:3001/api/v1/equipments/7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d \
   -H 'Content-Type: application/json' \
-  -d '{
-    "projectName": "Proyecto actualizado"
-  }'
+  -d '{"name": "Excavadora hidráulica 320 GX"}'
 ```
 
 ### `200 OK`
 
 ```json
 {
-  "message": "Peticion actualizada correctamente",
+  "message": "Maquinaria actualizada correctamente",
   "data": {
-    "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
-    "projectName": "Proyecto actualizado",
-    "status": "PENDING"
+    "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+    "name": "Excavadora hidráulica 320 GX"
   }
 }
 ```
@@ -688,14 +694,351 @@ curl -X PATCH \
 }
 ```
 
-### `409 Conflict`
+---
 
-Si la solicitud ya no está `PENDING`:
+## PATCH `/api/v1/equipments/:id/status`
+
+```bash
+curl -X PATCH http://localhost:3001/api/v1/equipments/7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d/status \
+  -H 'Content-Type: application/json' \
+  -d '{"status": "Mant. preventivo"}'
+```
+
+El único campo es `status` y es obligatorio.
+
+### `200 OK`
+
+La respuesta devuelve la maquinaria completa, sin envoltorio adicional:
+
+```json
+{
+  "message": "Estado actualizado correctamente",
+  "data": {
+    "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+    "assetNumber": "SYN-DEMO-01",
+    "status": "Mant. preventivo"
+  }
+}
+```
+
+Este endpoint no valida transiciones: cualquier estado válido puede pasar a cualquier otro, y tampoco comprueba si la maquinaria está asignada a una solicitud aprobada.
+
+---
+
+## DELETE `/api/v1/equipments/:id`
+
+```bash
+curl -i -X DELETE http://localhost:3001/api/v1/equipments/7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d
+```
+
+Responde **204 No Content**. El borrado es lógico. Si no existe, `404 equipment_not_found`.
+
+---
+
+# API de solicitudes
+
+## POST `/api/v1/requests`
+
+Crea una solicitud de maquinaria. El estado inicial siempre es `Pendiente`.
+
+### Request
+
+```bash
+curl -X POST http://localhost:3001/api/v1/requests \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "project": "Ampliación carretera Los Chorros",
+    "type": "Excavadora",
+    "requester": "Gerencia Técnica",
+    "startDate": "2030-01-10T08:00:00Z",
+    "endDate": "2030-01-25T17:00:00Z"
+  }'
+```
+
+### Campos
+
+| Campo | Tipo | Requerido | Validación |
+|---|---|---:|---|
+| `project` | string | Sí | Máximo 250 caracteres |
+| `type` | string | Sí | Máximo 100 caracteres. Debe coincidir con el `equipmentClass` de la maquinaria a asignar |
+| `requester` | string | Sí | Máximo 200 caracteres |
+| `startDate` | RFC3339 datetime | Sí | Fecha válida |
+| `endDate` | RFC3339 datetime | Sí | Debe ser posterior a `startDate` |
+| `status` | string | No | Si se envía, debe normalizar a `Pendiente` |
+
+> El modelo tiene `location`, `latitude` y `longitude`, pero **no forman parte del contrato de creación**. Si se envían, se descartan. Ver [Notas conocidas](#notas-conocidas-de-la-implementación).
+
+### `201 Created`
+
+```json
+{
+  "message": "Solicitud registrada correctamente",
+  "data": {
+    "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
+    "project": "Ampliación carretera Los Chorros",
+    "type": "Excavadora",
+    "requester": "Gerencia Técnica",
+    "location": "",
+    "latitude": 0,
+    "longitude": 0,
+    "startDate": "2030-01-10T08:00:00Z",
+    "endDate": "2030-01-25T17:00:00Z",
+    "status": "Pendiente"
+  }
+}
+```
+
+### `400 Bad Request`
+
+```json
+{
+  "error": "invalid_request",
+  "message": "Los datos enviados no son válidos",
+  "detail": "..."
+}
+```
+
+Si se envía un `status` distinto de `Pendiente`:
+
+```json
+{
+  "error": "invalid_status",
+  "message": "Una solicitud nueva debe iniciar Pendiente"
+}
+```
+
+### `422 Unprocessable Entity`
+
+Si `endDate <= startDate`:
+
+```json
+{
+  "error": "invalid_period",
+  "message": "endDate debe ser posterior a startDate"
+}
+```
+
+---
+
+## GET `/api/v1/requests`
+
+### Query parameters
+
+| Parámetro | Default | Descripción |
+|---|---:|---|
+| `page` | `1` | Página actual |
+| `pageSize` | `20` | Registros por página; máximo efectivo `100` |
+| `status` | — | `Pendiente` o `Aprobada`. Un valor no reconocido devuelve una lista vacía, no un error |
+| `type` | — | Coincidencia exacta, sin distinguir mayúsculas |
+| `search` | — | Busca en `project`, `type`, `requester` y `machinery` |
+
+```bash
+curl 'http://localhost:3001/api/v1/requests?status=Pendiente&type=Excavadora&page=1&pageSize=20'
+```
+
+### `200 OK`
+
+```json
+{
+  "data": [
+    {
+      "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
+      "project": "Ampliación carretera Los Chorros",
+      "type": "Excavadora",
+      "requester": "Gerencia Técnica",
+      "startDate": "2030-01-10T08:00:00Z",
+      "endDate": "2030-01-25T17:00:00Z",
+      "status": "Pendiente"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "pageSize": 20,
+    "total": 1,
+    "totalPages": 1
+  }
+}
+```
+
+Ordenado por `createdAt` descendente.
+
+---
+
+## POST `/api/v1/requests/search`
+
+Búsqueda avanzada. A diferencia de `GET /requests`, permite filtrar por **varios estados a la vez** y por solicitante parcial.
+
+### Request
+
+```bash
+curl -X POST http://localhost:3001/api/v1/requests/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "Los Chorros",
+    "statuses": ["Pendiente", "Aprobada"],
+    "type": "Excavadora",
+    "requester": "Gerencia",
+    "page": 1,
+    "pageSize": 20
+  }'
+```
+
+### Campos
+
+| Campo | Tipo | Requerido | Descripción |
+|---|---|---:|---|
+| `query` | string | No | Busca en `project`, `type`, `requester` y `machinery`. Máximo 500 caracteres |
+| `statuses` | array de string | No | Los valores no reconocidos se ignoran. Si ninguno es válido, el resultado es vacío |
+| `type` | string | No | Coincidencia exacta, sin distinguir mayúsculas |
+| `requester` | string | No | Coincidencia parcial |
+| `page` | int | No | Default `1` |
+| `pageSize` | int | No | Default `20`; máximo `100` |
+
+Un body vacío `{}` es válido y devuelve la primera página sin filtros.
+
+### `200 OK`
+
+La forma de la respuesta es distinta a la del listado: los resultados van dentro de `data.requests`.
+
+```json
+{
+  "data": {
+    "count": 1,
+    "requests": [
+      {
+        "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
+        "project": "Ampliación carretera Los Chorros",
+        "type": "Excavadora",
+        "requester": "Gerencia Técnica",
+        "startDate": "2030-01-10T08:00:00Z",
+        "endDate": "2030-01-25T17:00:00Z",
+        "status": "Pendiente",
+        "createdAt": "2026-09-13T20:00:00Z",
+        "updatedAt": "2026-09-13T20:00:00Z"
+      }
+    ]
+  },
+  "pagination": {
+    "page": 1,
+    "pageSize": 20,
+    "total": 1,
+    "totalPages": 1
+  }
+}
+```
+
+### `400 Bad Request`
+
+```json
+{
+  "error": "invalid_query",
+  "message": "La consulta no puede superar 500 caracteres"
+}
+```
+
+---
+
+## GET `/api/v1/requests/:requestID`
+
+```bash
+curl http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057
+```
+
+### `404 Not Found`
+
+```json
+{
+  "error": "request_not_found",
+  "message": "La solicitud no existe"
+}
+```
+
+---
+
+## PATCH `/api/v1/requests/:requestID`
+
+Actualiza parcialmente una solicitud. Solo se permite cuando el estado actual es `Pendiente`.
+
+Campos admitidos:
+
+```text
+project
+type
+requester
+startDate
+endDate
+```
+
+```bash
+curl -X PATCH \
+  http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057 \
+  -H 'Content-Type: application/json' \
+  -d '{"project": "Ampliación carretera Los Chorros - fase 2"}'
+```
+
+### `200 OK`
+
+```json
+{
+  "message": "Solicitud actualizada correctamente",
+  "data": {
+    "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
+    "project": "Ampliación carretera Los Chorros - fase 2",
+    "status": "Pendiente"
+  }
+}
+```
+
+### `400 Bad Request` — actualización vacía
+
+```json
+{
+  "error": "empty_update",
+  "message": "Debe enviar al menos un campo"
+}
+```
+
+### `422 Unprocessable Entity`
+
+Si el rango resultante deja `endDate <= startDate`, considerando los valores ya almacenados:
+
+```json
+{
+  "error": "invalid_period",
+  "message": "endDate debe ser posterior a startDate"
+}
+```
+
+### `409 Conflict`
 
 ```json
 {
   "error": "request_cannot_be_updated",
-  "message": "Solo se pueden modificar peticiones con estado PENDING"
+  "message": "Solo se pueden modificar solicitudes pendientes"
+}
+```
+
+---
+
+## DELETE `/api/v1/requests/:requestID`
+
+Elimina una solicitud mediante borrado lógico. Solo se permite cuando está `Pendiente` **y** no tiene maquinaria asignada.
+
+```bash
+curl -i -X DELETE \
+  http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057
+```
+
+### `204 No Content`
+
+Sin body.
+
+### `409 Conflict`
+
+```json
+{
+  "error": "request_cannot_be_deleted",
+  "message": "Solo se pueden eliminar solicitudes pendientes sin maquinaria asignada"
 }
 ```
 
@@ -703,9 +1046,7 @@ Si la solicitud ya no está `PENDING`:
 
 ## PATCH `/api/v1/requests/:requestID/status`
 
-Cambia el estado de una solicitud y registra la transición en el historial.
-
-La operación utiliza una transacción PostgreSQL y `SELECT ... FOR UPDATE` para reducir condiciones de carrera durante cambios concurrentes.
+Cambia el estado de una solicitud y registra la transición. Usa una transacción con `SELECT ... FOR UPDATE`.
 
 ### Request
 
@@ -714,8 +1055,8 @@ curl -X PATCH \
   http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057/status \
   -H 'Content-Type: application/json' \
   -d '{
-    "status": "ASSIGNED",
-    "reason": "Maquinaria confirmada para la solicitud"
+    "status": "Pendiente",
+    "reason": "Se libera la maquinaria por cambio de cronograma"
   }'
 ```
 
@@ -723,7 +1064,7 @@ curl -X PATCH \
 
 | Campo | Requerido | Validación |
 |---|---:|---|
-| `status` | Sí | `PENDING`, `ASSIGNED`, `COMPLETED` o `CANCELLED` |
+| `status` | Sí | `Pendiente` o `Aprobada`, con las variantes normalizadas |
 | `reason` | Sí | Entre 3 y 250 caracteres |
 
 ### `200 OK`
@@ -734,62 +1075,54 @@ curl -X PATCH \
   "data": {
     "request": {
       "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
-      "status": "ASSIGNED"
+      "status": "Pendiente"
     },
     "transition": {
       "id": "5f37962e-d2ad-44ad-8388-f76978fda8ad",
       "requestId": "d00271c7-6553-4461-97e2-ab6f5132b057",
-      "fromStatus": "PENDING",
-      "toStatus": "ASSIGNED",
-      "reason": "Maquinaria confirmada para la solicitud"
+      "fromStatus": "Aprobada",
+      "toStatus": "Pendiente",
+      "reason": "Se libera la maquinaria por cambio de cronograma",
+      "changedAt": "2026-09-13T22:00:00Z"
     }
   }
 }
 ```
 
-### `400 Bad Request`
+Al pasar de `Aprobada` a `Pendiente`, la maquinaria asociada vuelve automáticamente a `Disponible` y `machinery` queda en `null`.
 
-Estado no reconocido:
+### `400 Bad Request`
 
 ```json
 {
-  "error": "invalid_request",
-  "message": "Los datos enviados no son válidos",
-  "detail": "..."
+  "error": "invalid_status",
+  "message": "El estado de solicitud no es válido"
 }
 ```
 
-### `422 Unprocessable Entity`
+### `409 Conflict`
 
-Transición no permitida, por ejemplo `PENDING -> COMPLETED`:
+El código HTTP para una transición rechazada es **409**, no 422. El mensaje varía según la causa:
 
 ```json
 {
   "error": "invalid_status_transition",
-  "message": "invalid request status transition: PENDING -> COMPLETED"
+  "message": "invalid request status transition"
 }
 ```
-
-También se rechaza intentar asignar nuevamente el mismo estado.
-
-### `409 Conflict`
-
-Puede ocurrir si otro proceso modificó el estado durante la operación:
 
 ```json
 {
-  "error": "concurrent_status_change",
-  "message": "El estado de la petición cambió durante la operación. Consulte nuevamente."
+  "error": "invalid_status_transition",
+  "message": "machinery is required before approval"
 }
 ```
+
+> Para aprobar una solicitud normalmente no se usa este endpoint, sino `PATCH /requests/:requestID/assignment`, que asigna la maquinaria y aprueba en una sola operación.
 
 ---
 
 ## GET `/api/v1/requests/:requestID/status-history`
-
-Devuelve el historial de transiciones de una solicitud, ordenado por `changed_at DESC`.
-
-### Request
 
 ```bash
 curl http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057/status-history
@@ -803,80 +1136,170 @@ curl http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057/
     {
       "id": "5f37962e-d2ad-44ad-8388-f76978fda8ad",
       "requestId": "d00271c7-6553-4461-97e2-ab6f5132b057",
-      "fromStatus": "PENDING",
-      "toStatus": "ASSIGNED",
+      "fromStatus": "Pendiente",
+      "toStatus": "Aprobada",
       "reason": "Maquinaria confirmada para la solicitud",
-      "changedAt": "2030-08-21T10:30:00Z"
+      "changedAt": "2026-09-13T21:00:00Z"
     }
   ]
 }
 ```
 
-Si la solicitud no existe responde `404 request_not_found`.
+Ordenado por `changedAt` descendente. Si la solicitud no existe responde `404 request_not_found`.
 
 ---
 
-## GET `/api/v1/requests/:requestID/recommendations`
+# Asignación de maquinaria
 
-Genera un ranking de maquinaria para una solicitud `PENDING`.
+## PATCH `/api/v1/requests/:requestID/assignment`
 
-Este endpoint consulta `fleet-service` en tiempo real.
+Asigna una maquinaria a una solicitud y la aprueba, en una sola transacción.
 
 ### Request
 
 ```bash
-curl \
-  http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057/recommendations
+curl -X PATCH \
+  http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057/assignment \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "equipmentId": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+    "reason": "Maquinaria confirmada para la solicitud"
+  }'
+```
+
+### Campos
+
+| Campo | Requerido | Validación |
+|---|---:|---|
+| `equipmentId` | Sí | UUID de la maquinaria |
+| `reason` | No | Máximo 250 caracteres. Se guarda en el historial |
+
+### Condiciones verificadas
+
+Las tres se evalúan dentro de la transacción, con ambas filas bloqueadas:
+
+1. la solicitud debe estar `Pendiente`;
+2. la maquinaria debe estar `Disponible`;
+3. `request.type` debe ser igual a `equipment.equipmentClass`, sin distinguir mayúsculas.
+
+### Efectos
+
+```text
+Solicitud    machinery = assetNumber de la maquinaria
+             status    = Aprobada
+Maquinaria   status    = Ocupada
+Historial    Pendiente -> Aprobada
 ```
 
 ### `200 OK`
 
 ```json
 {
+  "message": "Maquinaria asignada y solicitud aprobada correctamente",
   "data": {
-    "requestId": "d00271c7-6553-4461-97e2-ab6f5132b057",
-    "count": 1,
-    "recommendations": [
-      {
-        "equipmentId": "a87277e1-0ab8-42cc-a475-5375de107feb",
-        "code": "EXC-NEAR",
-        "type": "EXCAVATOR",
-        "brand": "Caterpillar",
-        "model": "320",
-        "serialNumber": "CAT320-0001",
-        "year": 2025,
-        "capacityTons": 23,
-        "location": {
-          "name": "San Miguel",
-          "latitude": 13.4835,
-          "longitude": -88.1828
-        },
-        "distanceKm": 0.06,
-        "engineHours": 100,
-        "nextMaintenanceHours": 600,
-        "maintenanceHoursRemaining": 500,
-        "fuelPercent": 95,
-        "score": 99.23,
-        "reasons": [
-          "Maquinaria disponible",
-          "Se encuentra a 0.06 km del proyecto",
-          "Tiene 500.00 horas antes del próximo mantenimiento",
-          "Nivel de combustible de 95.00%"
-        ]
-      }
-    ]
+    "request": {
+      "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
+      "project": "Ampliación carretera Los Chorros",
+      "type": "Excavadora",
+      "status": "Aprobada",
+      "machinery": "SYN-DEMO-01"
+    },
+    "equipment": {
+      "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+      "assetNumber": "SYN-DEMO-01",
+      "equipmentClass": "Excavadora",
+      "status": "Ocupada"
+    },
+    "transition": {
+      "id": "5f37962e-d2ad-44ad-8388-f76978fda8ad",
+      "requestId": "d00271c7-6553-4461-97e2-ab6f5132b057",
+      "fromStatus": "Pendiente",
+      "toStatus": "Aprobada",
+      "reason": "Maquinaria confirmada para la solicitud",
+      "changedAt": "2026-09-13T21:00:00Z"
+    }
   }
 }
 ```
 
-Una lista vacía sigue siendo una respuesta exitosa `200`:
+### `400 Bad Request`
 
 ```json
 {
+  "error": "invalid_equipment_id",
+  "message": "equipmentId debe ser un UUID válido"
+}
+```
+
+### `404 Not Found`
+
+```json
+{
+  "error": "request_or_equipment_not_found",
+  "message": "La solicitud o la maquinaria no existe"
+}
+```
+
+### `409 Conflict`
+
+Un solo código de error cubre las tres condiciones; el `message` indica cuál falló:
+
+```json
+{
+  "error": "assignment_conflict",
+  "message": "request is not pending"
+}
+```
+
+```json
+{
+  "error": "assignment_conflict",
+  "message": "equipment is not available"
+}
+```
+
+```json
+{
+  "error": "assignment_conflict",
+  "message": "equipment class does not match request type"
+}
+```
+
+---
+
+## DELETE `/api/v1/requests/:requestID/assignment`
+
+Libera la maquinaria asignada y devuelve la solicitud a `Pendiente`.
+
+### Request
+
+```bash
+curl -X DELETE \
+  'http://localhost:3001/api/v1/requests/d00271c7-6553-4461-97e2-ab6f5132b057/assignment?reason=cancelacion-de-proyecto'
+```
+
+El parámetro de query `reason` es opcional; si se omite se registra `Liberación solicitada`.
+
+### Efectos
+
+```text
+Maquinaria   status    = Disponible
+Solicitud    machinery = null
+             status    = Pendiente
+Historial    Aprobada -> Pendiente
+```
+
+### `200 OK`
+
+A diferencia de la asignación, aquí `data` es la solicitud directamente:
+
+```json
+{
+  "message": "Maquinaria liberada correctamente",
   "data": {
-    "requestId": "d00271c7-6553-4461-97e2-ab6f5132b057",
-    "count": 0,
-    "recommendations": []
+    "id": "d00271c7-6553-4461-97e2-ab6f5132b057",
+    "project": "Ampliación carretera Los Chorros",
+    "status": "Pendiente"
   }
 }
 ```
@@ -885,19 +1308,8 @@ Una lista vacía sigue siendo una respuesta exitosa `200`:
 
 ```json
 {
-  "error": "request_not_pending",
-  "message": "Solo se pueden generar recomendaciones para peticiones con estado PENDING"
-}
-```
-
-### `502 Bad Gateway`
-
-Si `fleet-service` no está disponible o responde de forma inesperada:
-
-```json
-{
-  "error": "fleet_service_unavailable",
-  "message": "No se pudo consultar la maquinaria disponible"
+  "error": "release_conflict",
+  "message": "request has no assigned machinery"
 }
 ```
 
@@ -905,9 +1317,24 @@ Si `fleet-service` no está disponible o responde de forma inesperada:
 
 # Casos de uso
 
-## Caso 1 — Registrar una necesidad de maquinaria
+## Caso 1 — Cargar el inventario de maquinaria
 
-Un proyecto necesita una excavadora en San Miguel durante un rango de fechas.
+```text
+POST /api/v1/equipments
+        │
+        ▼
+Se valida company, assetNumber, name y equipmentClass
+        │
+        ▼
+Estado inicial Disponible
+        │
+        ▼
+201 Created
+```
+
+---
+
+## Caso 2 — Registrar una necesidad de maquinaria
 
 ```text
 Cliente
@@ -921,223 +1348,172 @@ logistic-service
 PostgreSQL
   |
   v
-Request = PENDING
+Solicitud = Pendiente
 ```
 
-La solicitud queda disponible para edición y recomendación.
+La solicitud queda disponible para edición y asignación.
 
 ---
 
-## Caso 2 — Corregir datos antes de asignar maquinaria
+## Caso 3 — Corregir datos antes de asignar
 
-Mientras la solicitud siga `PENDING` puede modificarse:
-
-- tipo de equipo;
-- nombre del proyecto;
-- ubicación;
-- fecha de inicio;
-- fecha de finalización.
+Mientras la solicitud siga `Pendiente` pueden modificarse el proyecto, el tipo, el solicitante y las fechas:
 
 ```http
 PATCH /api/v1/requests/{requestID}
 ```
 
-Una vez `ASSIGNED`, `COMPLETED` o `CANCELLED`, la modificación se rechaza.
+Una vez `Aprobada`, la modificación se rechaza con `409 request_cannot_be_updated`. Para volver a editarla hay que liberar primero la maquinaria.
 
 ---
 
-## Caso 3 — Buscar la maquinaria más conveniente
-
-```http
-GET /api/v1/requests/{requestID}/recommendations
-```
-
-Logistics:
-
-1. obtiene la solicitud;
-2. comprueba que esté `PENDING`;
-3. consulta equipos `AVAILABLE` del tipo requerido en Fleet;
-4. descarta equipos con mantenimiento vencido;
-5. calcula distancia Haversine;
-6. calcula score;
-7. devuelve los mejores candidatos primero.
-
----
-
-## Caso 4 — Marcar una solicitud como asignada
-
-```http
-PATCH /api/v1/requests/{requestID}/status
-```
-
-```json
-{
-  "status": "ASSIGNED",
-  "reason": "Se confirmó la excavadora EXC-001"
-}
-```
-
-El cambio genera automáticamente un registro:
+## Caso 4 — Asignar maquinaria y aprobar
 
 ```text
-PENDING -> ASSIGNED
+GET /api/v1/equipments?equipmentClass=Excavadora&status=Disponible
+        │
+        ▼
+Elegir el assetNumber adecuado
+        │
+        ▼
+PATCH /api/v1/requests/{requestID}/assignment
+        │
+        ▼
+Solicitud Aprobada + maquinaria Ocupada + historial
 ```
-
----
-
-## Caso 5 — Completar una solicitud
-
-Solo una solicitud `ASSIGNED` puede pasar a `COMPLETED`.
-
-```json
-{
-  "status": "COMPLETED",
-  "reason": "Trabajo logístico completado"
-}
-```
-
-Después de esto la solicitud queda en estado terminal.
-
----
-
-## Caso 6 — Cancelar una solicitud
-
-Puede cancelarse desde:
-
-- `PENDING`;
-- `ASSIGNED`.
 
 Ejemplo:
 
-```json
-{
-  "status": "CANCELLED",
-  "reason": "Proyecto suspendido por el cliente"
-}
+```bash
+curl -X PATCH \
+  http://localhost:3001/api/v1/requests/$REQUEST_ID/assignment \
+  -H 'Content-Type: application/json' \
+  -d '{"equipmentId":"'"$EQUIPMENT_ID"'","reason":"Se confirmó la excavadora"}'
 ```
 
 ---
 
-# Motor de recomendaciones
+## Caso 5 — Cerrar el trabajo y devolver la maquinaria al inventario
 
-El algoritmo es **determinista** y no utiliza IA generativa ni LLM para decidir.
+Cuando el trabajo termina, la maquinaria se libera:
 
-## Reglas de elegibilidad
-
-Un equipo solo participa cuando:
-
-```text
-status == AVAILABLE
-AND type == request.equipmentType
-AND nextMaintenanceHours - engineHours > 0
+```http
+DELETE /api/v1/requests/{requestID}/assignment?reason=trabajo-finalizado
 ```
 
-Aunque `fleet-service` ya recibe filtros por estado y tipo, Logistics valida nuevamente estos campos antes de calcular el ranking.
+Como alternativa, si la maquinaria quedó fuera de servicio, puede marcarse directamente:
 
-## Distancia
-
-Se utiliza la fórmula de Haversine con un radio terrestre de `6371 km`.
-
-```text
-Proyecto (lat, lon)
-       |
-       | Haversine
-       v
-Maquinaria (lat, lon)
-       |
-       v
- distanceKm
+```http
+PATCH /api/v1/equipments/{id}/status
 ```
 
-La distancia es geográfica en línea recta; no representa distancia real por carretera.
-
-## Score
-
-El resultado se normaliza a un máximo de `100` puntos:
-
-| Factor | Peso máximo |
-|---|---:|
-| Distancia | 60 |
-| Margen antes del mantenimiento | 25 |
-| Combustible | 15 |
-| **Total** | **100** |
-
-Fórmula:
-
-```text
-distanceFactor    = 1 - clamp(distanceKm / 200, 0, 1)
-maintenanceFactor = clamp(maintenanceHoursRemaining / 500, 0, 1)
-fuelFactor        = clamp(fuelPercent / 100, 0, 1)
-
-score = distanceFactor * 60
-      + maintenanceFactor * 25
-      + fuelFactor * 15
+```json
+{ "status": "Mant. correctivo" }
 ```
-
-Donde:
-
-```text
-maintenanceHoursRemaining = nextMaintenanceHours - engineHours
-```
-
-Los resultados se ordenan:
-
-1. mayor `score` primero;
-2. si el score empata, menor `distanceKm` primero.
-
-Para la explicación completa consultar [`recommendation-algorithm.md`](recommendation-algorithm.md).
 
 ---
 
-# Integración con Fleet Service
+## Caso 6 — Cancelar una asignación
 
-`logistic-service` utiliza un cliente HTTP con timeout de **5 segundos**.
+El modelo actual no tiene un estado `Cancelada`. Una cancelación se representa liberando la maquinaria, lo que devuelve la solicitud a `Pendiente` y deja el motivo en el historial:
 
-Para obtener candidatos realiza llamadas como:
-
-```http
-GET {FLEET_SERVICE_URL}/api/v1/equipments?type=EXCAVATOR&status=AVAILABLE&page=1&pageSize=100
+```bash
+curl -X DELETE \
+  'http://localhost:3001/api/v1/requests/'"$REQUEST_ID"'/assignment?reason=proyecto-suspendido'
 ```
 
-El cliente recorre todas las páginas indicadas por `pagination.totalPages`.
+Si además la solicitud ya no aplica, puede eliminarse:
 
-Formato esperado de Fleet:
+```bash
+curl -i -X DELETE http://localhost:3001/api/v1/requests/$REQUEST_ID
+```
+
+---
+
+## Caso 7 — Auditar el ciclo de una solicitud
+
+```http
+GET /api/v1/requests/{requestID}/status-history
+```
+
+Cada asignación y cada liberación deja su propia fila, con el motivo enviado en `reason`.
+
+---
+
+# Carga de datos sintéticos
+
+El script `seed-entropy-synthetic-data.sh` (mantenido fuera de este repositorio, junto a los demás servicios de Entropy) carga un conjunto correlacionado de datos de prueba usando únicamente HTTP.
+
+Contra este servicio ejecuta:
+
+| Llamada | Cantidad aproximada |
+|---|---|
+| `POST /api/v1/equipments` | 25 maquinarias, incluida una sin pareja en Fleet |
+| `POST /api/v1/requests` | 10 solicitudes de proyectos |
+| `PATCH /api/v1/requests/{id}/assignment` | 4 asignaciones |
+| `PATCH /api/v1/equipments/{id}/status` | Cambios de estado del caso completado |
+| `DELETE /api/v1/requests/{id}/assignment` | 1 liberación, para el caso cancelado |
+
+Además llama a `GET /health` antes de empezar y coordina cada maquinaria con su vehículo equivalente en `fleet-service` y con la proyección unificada del `mcp-server`.
+
+Configuración por variables de entorno, sin valores dentro del repositorio:
+
+```bash
+FLEET_URL=http://localhost:3000 \
+LOGISTIC_URL=http://localhost:3001 \
+MCP_URL=http://localhost:3002 \
+SEED_RUN=SYNTH-DEMO \
+./seed-entropy-synthetic-data.sh
+```
+
+`SEED_RUN` identifica la corrida y se incrusta en `assetNumber` y en el nombre del proyecto, de modo que todo el conjunto puede aislarse después con `search`.
+
+Al finalizar, el conjunto esperado en este servicio es de 10 solicitudes: 7 `Pendiente` y 3 `Aprobada`.
+
+> El script envía una cabecera `Authorization: Bearer`. Este servicio **no** valida credenciales: la cabecera se ignora. No incrustes tokens reales en scripts versionados.
+
+---
+
+# Manejo de errores
+
+Formato general:
 
 ```json
 {
-  "data": [
-    {
-      "id": "a87277e1-0ab8-42cc-a475-5375de107feb",
-      "code": "EXC-001",
-      "type": "EXCAVATOR",
-      "status": "AVAILABLE",
-      "location": {
-        "name": "San Miguel",
-        "latitude": 13.4835,
-        "longitude": -88.1828
-      },
-      "engineHours": 100,
-      "nextMaintenanceHours": 600,
-      "fuelPercent": 95
-    }
-  ],
-  "pagination": {
-    "page": 1,
-    "pageSize": 100,
-    "total": 1,
-    "totalPages": 1
-  }
+  "error": "error_code",
+  "message": "Descripción legible del error"
 }
 ```
 
-También existe código de cliente para:
+En los errores de binding también se incluye el detalle del validador:
 
-```http
-GET /api/v1/equipments/{equipmentID}
-PATCH /api/v1/equipments/{equipmentID}/status
+```json
+{
+  "detail": "detalle técnico de validación"
+}
 ```
 
-Estos métodos están destinados al módulo de asignaciones que todavía está en desarrollo.
+Errores relevantes:
+
+| HTTP | Código | Descripción |
+|---:|---|---|
+| `400` | `invalid_request` | Payload inválido |
+| `400` | `invalid_id` | UUID inválido en la ruta |
+| `400` | `invalid_equipment_id` | `equipmentId` no es un UUID |
+| `400` | `invalid_status` | Estado fuera del catálogo |
+| `400` | `invalid_query` | `query` de búsqueda mayor a 500 caracteres |
+| `400` | `empty_update` | PATCH sin campos |
+| `404` | `request_not_found` | Solicitud inexistente |
+| `404` | `equipment_not_found` | Maquinaria inexistente |
+| `404` | `request_or_equipment_not_found` | Falta alguna de las dos al asignar |
+| `409` | `equipment_already_exists` | `assetNumber` duplicado |
+| `409` | `request_cannot_be_updated` | La solicitud no está `Pendiente` |
+| `409` | `request_cannot_be_deleted` | La solicitud no está `Pendiente` o tiene maquinaria asignada |
+| `409` | `invalid_status_transition` | Transición no permitida o falta maquinaria para aprobar |
+| `409` | `assignment_conflict` | Estado o clase incompatibles al asignar |
+| `409` | `release_conflict` | La solicitud no tiene maquinaria asignada |
+| `422` | `invalid_period` | `endDate` no es posterior a `startDate` |
+| `500` | `database_error` | Error interno de persistencia |
 
 ---
 
@@ -1154,8 +1530,6 @@ stdout
 app.log
 ```
 
-Ejemplo:
-
 ```env
 LOGGING_TYPE=local
 ```
@@ -1167,10 +1541,7 @@ LOGGING_TYPE=GCP
 GCP_PROJECT_ID=my-project
 ```
 
-Utiliza:
-
-- Google Cloud Logging;
-- Google Error Reporting.
+Utiliza Google Cloud Logging y Google Error Reporting.
 
 ## Trazas
 
@@ -1180,8 +1551,6 @@ Utiliza:
 TRACE_TYPE=STDOUT
 SERVICE_NAME=logistic-service
 ```
-
-Las trazas se imprimen en consola.
 
 ### OTLP
 
@@ -1216,6 +1585,8 @@ O:
 ```env
 TRACE_TYPE=DISABLED
 ```
+
+> El proveedor de OpenTelemetry se inicializa correctamente, pero ningún handler ni capa de base de datos abre spans, y el router no instala middleware de instrumentación. En la práctica no se emite ninguna traza. Ver [Notas conocidas](#notas-conocidas-de-la-implementación).
 
 ---
 
@@ -1258,21 +1629,7 @@ El repositorio contiene:
 logistic-service-test.sh
 ```
 
-El script prueba principalmente:
-
-- creación de solicitudes;
-- estado inicial `PENDING`;
-- listado;
-- consulta por UUID;
-- actualización parcial;
-- persistencia del cambio;
-- rechazo de estados inválidos;
-- transiciones válidas e inválidas;
-- historial de estados;
-- estados terminales;
-- cancelación;
-- UUID inválido;
-- solicitud inexistente.
+> **Este script está desactualizado.** Fue escrito para el modelo anterior: envía `equipmentType`, `projectName` y `location`, y espera los estados `PENDING`, `ASSIGNED`, `COMPLETED` y `CANCELLED`. Falla en el primer paso, porque `POST /requests` ahora exige `project`, `type` y `requester` y responde `400`. Necesita reescribirse contra el modelo de dos estados y el flujo de asignación.
 
 ## Dependencias
 
@@ -1281,33 +1638,36 @@ curl
 jq
 ```
 
-## Ejecutar
+## Flujo de humo manual
+
+Mientras el script se actualiza, el ciclo completo puede verificarse a mano:
 
 ```bash
-chmod +x logistic-service-test.sh
-./logistic-service-test.sh
-```
+BASE=http://localhost:3001/api/v1
 
-Por defecto utiliza:
+# 1. Crear maquinaria
+curl -X POST $BASE/equipments \
+  -H 'Content-Type: application/json' \
+  -d '{"company":"ECON","assetNumber":"SMOKE-01","name":"Excavadora de prueba","equipmentClass":"Excavadora"}'
 
-```text
-http://localhost:3001/api/v1/requests
-```
+# 2. Crear solicitud del mismo tipo
+curl -X POST $BASE/requests \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"Proyecto de humo","type":"Excavadora","requester":"QA","startDate":"2030-01-10T08:00:00Z","endDate":"2030-01-25T17:00:00Z"}'
 
-Se puede sobrescribir:
+# 3. Asignar
+curl -X PATCH $BASE/requests/<REQUEST_ID>/assignment \
+  -H 'Content-Type: application/json' \
+  -d '{"equipmentId":"<EQUIPMENT_ID>","reason":"Prueba de humo"}'
 
-```bash
-BASE_URL=http://localhost:3001/api/v1/requests \
-./logistic-service-test.sh
-```
+# 4. Verificar que la maquinaria quedó Ocupada
+curl $BASE/equipments/<EQUIPMENT_ID>
 
-> El script actual no cubre el endpoint de recomendaciones, ya que esa prueba necesita además datos controlados en `fleet-service`.
+# 5. Liberar
+curl -X DELETE "$BASE/requests/<REQUEST_ID>/assignment?reason=fin-de-prueba"
 
-Para recomendaciones, el flujo end-to-end esperado consiste en crear equipos en Fleet, crear una solicitud en Logistics y consultar:
-
-```bash
-curl \
-  http://localhost:3001/api/v1/requests/$REQUEST_ID/recommendations
+# 6. Revisar el historial
+curl $BASE/requests/<REQUEST_ID>/status-history
 ```
 
 ---
@@ -1321,14 +1681,19 @@ curl \
 │       └── main.go
 │
 ├── internal/
-│   ├── assigments/
+│   ├── equipments/          # maquinaria Prisma
 │   │   ├── db/
+│   │   │   └── postgres/
 │   │   ├── domain/
 │   │   ├── dto/
 │   │   └── handlers/
 │   │
-│   ├── clients/
-│   │   └── fleet/
+│   ├── requests/            # solicitudes y asignaciones
+│   │   ├── db/
+│   │   │   └── postgres/
+│   │   ├── domain/
+│   │   ├── dto/
+│   │   └── handlers/
 │   │
 │   ├── database/
 │   │   └── postgres/
@@ -1337,14 +1702,6 @@ curl \
 │   ├── logging/
 │   │   ├── gcp/
 │   │   └── local/
-│   │
-│   ├── recomendations/
-│   ├── requests/
-│   │   ├── db/
-│   │   │   └── postgres/
-│   │   ├── domain/
-│   │   ├── dto/
-│   │   └── handlers/
 │   │
 │   ├── router/
 │   ├── trace/
@@ -1366,4 +1723,56 @@ curl \
 └── recommendation-algorithm.png
 ```
 
+Los paquetes `clients/fleet`, `recomendations/` y `assigments/` fueron eliminados. La lógica de asignación vive ahora en `internal/requests/db/postgres/requests.go`.
+
+### Tablas creadas
+
+| Módulo | Tabla |
+|---|---|
+| Maquinaria | `prisma_machinery` |
+| Solicitudes | `prisma_machinery_requests` |
+| Historial de estados | `prisma_request_status_history` |
+
+Las tres usan borrado lógico (`deleted_at`).
+
 ---
+
+# Notas conocidas de la implementación
+
+Puntos detectados durante la revisión del código que conviene tener presentes o corregir.
+
+## La ubicación de la solicitud nunca se guarda
+
+El modelo `Request` tiene `location`, `latitude` y `longitude`, pero el DTO `CreateRequest` **no incluye esos campos** y `UpdateRequest` tampoco. Si el cliente los envía, Gin los descarta en silencio y la solicitud se persiste con `location: ""`, `latitude: 0` y `longitude: 0`. El script de datos sintéticos los envía en cada `POST /api/v1/requests` y ninguno se almacena. Es el mismo hueco que existe en `fleet-service` con las coordenadas del vehículo.
+
+## Documentación del motor de recomendaciones obsoleta
+
+`recommendation-algorithm.md` y `recommendation-algorithm.png` describen el algoritmo de scoring, la fórmula de Haversine y la integración HTTP con Fleet. Ese código ya no existe en el repositorio. Ambos archivos deberían eliminarse o marcarse como histórico.
+
+## `FLEET_SERVICE_URL` sigue declarada en despliegue
+
+La variable ya no se lee en el código, pero continúa presente en `cdeploy/manifests/dev.yaml` y `cdeploy/manifests/prod.yaml`. No rompe nada, pero induce a error sobre las dependencias reales del servicio.
+
+## Las trazas no se emiten
+
+`trace.NewTrace` construye el `TracerProvider` y lo registra globalmente, pero ningún handler ni capa de persistencia llama a `StartSpan`, y el router no instala middleware de OpenTelemetry para Gin. El resultado es que, con cualquier `TRACE_TYPE`, no se produce ninguna traza. `fleet-service` sí abre spans explícitos en sus módulos `equipments` y `fleets`.
+
+## `PATCH /equipments/:id/status` no considera las asignaciones
+
+El endpoint cambia el estado de una maquinaria sin verificar si está asignada a una solicitud aprobada. Es posible dejar una maquinaria en `Obsoletas` mientras `prisma_machinery_requests.machinery` sigue apuntando a ella, o devolverla a `Disponible` y permitir que se asigne dos veces.
+
+## La relación entre solicitud y maquinaria es por texto
+
+`Request.Machinery` guarda el `assetNumber` como cadena, sin llave foránea. Si una maquinaria cambia de `assetNumber` mediante `PATCH /equipments/:id`, las solicitudes que la referencian quedan apuntando a un valor que ya no existe, y las liberaciones posteriores no encontrarán la fila a devolver a `Disponible`.
+
+## `pgvector` declarado sin uso
+
+`go.mod` incluye `github.com/pgvector/pgvector-go` como dependencia directa, pero ningún archivo del proyecto lo importa. Probablemente quedó de una exploración de búsqueda semántica; puede retirarse con `go mod tidy`.
+
+## `logistic-service-test.sh` desactualizado
+
+El script prueba el contrato anterior por completo. Ver [Pruebas](#pruebas).
+
+## El servicio no valida autenticación
+
+No hay middleware de autenticación ni de API key. Las cabeceras `Authorization` que envían los clientes de integración se ignoran. El control de acceso depende por completo de la capa de red o del gateway que exponga el servicio.
